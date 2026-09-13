@@ -41,7 +41,8 @@ está no repositório.
 
 ## Instalação via JitPack
 
-Assim que o repositório estiver publicado e com uma tag no GitHub, dá pra
+O código está publicado em [github.com/AndreLucasrs/aegis4j](https://github.com/AndreLucasrs/aegis4j)
+e a tag `v0.2.0` já builda no [JitPack](https://jitpack.io/#AndreLucasrs/aegis4j) — dá pra
 adicionar como dependência sem compilar do zero:
 
 **Gradle** (`build.gradle.kts`):

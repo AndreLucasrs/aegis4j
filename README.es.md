@@ -6,8 +6,9 @@ Una librería para el ecosistema JVM (Java, Kotlin, Clojure, Scala) que se
 sitúa delante de los LLM, combinando:
 
 - **Abstracción de proveedor** — cambia de proveedor de LLM en tiempo de
-  ejecución (Ollama, y en el futuro Anthropic/OpenAI) detrás de una interfaz
-  `Provider` común.
+  ejecución (Ollama, Anthropic, y cualquier backend compatible con la API de
+  Chat Completions de OpenAI — la propia OpenAI, DeepSeek, Kimi/Moonshot,
+  Groq, servidores locales, etc.) detrás de una interfaz `Provider` común.
 - **Guardrails deterministas** — reglas que se ejecutan en código puro
   (regex, límites de longitud, etc.), nunca otra llamada a un LLM, aplicadas
   tanto en la entrada como en la salida.
@@ -40,6 +41,50 @@ al final.
 No se necesita instalación extra — el wrapper de Gradle (`./gradlew`) ya está
 en el repositorio.
 
+## Instalación vía JitPack
+
+El código está publicado en [github.com/AndreLucasrs/aegis4j](https://github.com/AndreLucasrs/aegis4j)
+y la tag `v0.2.0` ya builda en [JitPack](https://jitpack.io/#AndreLucasrs/aegis4j) — se puede
+agregar como dependencia sin compilar desde cero:
+
+**Gradle** (`build.gradle.kts`):
+
+```kotlin
+repositories {
+    maven { url = uri("https://jitpack.io") }
+}
+
+dependencies {
+    implementation("com.github.AndreLucasrs.aegis4j:aegis4j-core:<tag>")
+    implementation("com.github.AndreLucasrs.aegis4j:aegis4j-provider-ollama:<tag>")
+    // cualquier otro módulo: aegis4j-provider-anthropic, aegis4j-provider-openai,
+    // aegis4j-mcp, aegis4j-rag-jdbc-pgvector, aegis4j-rag-mcp, aegis4j-routing, ...
+}
+```
+
+**Maven** (`pom.xml`):
+
+```xml
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
+
+<dependency>
+    <groupId>com.github.AndreLucasrs.aegis4j</groupId>
+    <artifactId>aegis4j-core</artifactId>
+    <version>TAG</version>
+</dependency>
+```
+
+`<tag>`/`TAG` es una tag de release de GitHub (ej: `v0.2.0`) o un hash de
+commit. El groupId `com.github.AndreLucasrs.aegis4j` es el patrón estándar de
+JitPack para un proyecto multi-módulo (usuario.repositorio) — cada módulo se
+convierte en su propio `artifactId`, así que declará solo los que realmente
+usás.
+
 ## Build y pruebas
 
 ```bash
@@ -71,6 +116,10 @@ Variables de entorno (todas opcionales):
 | `AEGIS4J_MCP_RETRIEVER_URL`       | *(ninguno)*            | URL del servidor MCP, si el transporte es `http`             |
 | `AEGIS4J_MCP_RETRIEVER_TOOL`      | `search`              | Nombre de la tool MCP usada para la búsqueda                  |
 | `AEGIS4J_ROUTING_CONFIG`      | *(ninguno)*                | Ruta de un `routing.yaml` — activa el enrutamiento de `model` por request |
+| `AEGIS4J_ANTHROPIC_API_KEY`   | *(ninguno)*                | Clave de API — con `AEGIS4J_PROVIDER_ID=anthropic`, `AnthropicProvider` se registra solo vía `ServiceLoader` |
+| `AEGIS4J_OPENAI_COMPATIBLE_ID`      | *(ninguno)*          | Activa un `OpenAiCompatibleProvider` genérico (ej: `openai`, `deepseek`, `kimi`) — necesita `_BASE_URL` también |
+| `AEGIS4J_OPENAI_COMPATIBLE_BASE_URL`| *(ninguno)*          | URL base del backend compatible con OpenAI                  |
+| `AEGIS4J_OPENAI_COMPATIBLE_API_KEY` | *(ninguno)*          | Clave de API de ese backend, si hace falta                   |
 
 Ejemplo con la skill de ejemplo (`aegis4j-server/src/main/resources/skills`)
 cargada:
@@ -182,6 +231,80 @@ println(response.content())
 (println (.content (.chat engine request)))
 ```
 
+## Conectando cada provider
+
+Todos implementan la misma interfaz `Provider` — cambiar en runtime es solo
+registrar uno u otro. Ejemplos:
+
+**Ollama** (local):
+
+```java
+providerRegistry.register(OllamaProvider.create()); // lee AEGIS4J_OLLAMA_BASE_URL, por defecto http://localhost:11434
+```
+
+**Anthropic**:
+
+```java
+providerRegistry.register(AnthropicProvider.create()); // lee AEGIS4J_ANTHROPIC_API_KEY
+// o explícito:
+providerRegistry.register(new AnthropicProvider(
+        "https://api.anthropic.com", "sk-ant-...", HttpClient.newHttpClient(), Duration.ofSeconds(60)
+));
+
+engine.chat(ChatRequest.builder()
+        .providerId(AnthropicProvider.ID)
+        .model("claude-sonnet-5")
+        .userInput("explicá qué es pgvector")
+        .build());
+```
+
+**OpenAI**:
+
+```java
+providerRegistry.register(OpenAiCompatibleProvider.openAi()); // lee AEGIS4J_OPENAI_API_KEY
+
+engine.chat(ChatRequest.builder()
+        .providerId("openai")
+        .model("gpt-5")
+        .userInput("explicá qué es pgvector")
+        .build());
+```
+
+**DeepSeek** (API compatible con la de OpenAI):
+
+```java
+providerRegistry.register(OpenAiCompatibleProvider.deepSeek()); // lee AEGIS4J_DEEPSEEK_API_KEY
+
+engine.chat(ChatRequest.builder()
+        .providerId("deepseek")
+        .model("deepseek-chat")
+        .userInput("explicá qué es pgvector")
+        .build());
+```
+
+**Kimi (Moonshot AI), Groq, Together AI, OpenRouter, un servidor local
+(vLLM/LM Studio), o cualquier otro backend compatible con la API de Chat
+Completions de OpenAI** — usá `custom(...)` con el `id`, la `baseUrl` y la
+`apiKey` de ese proveedor. ⚠️ Confirmá la base URL exacta en la documentación
+actual del proveedor — cambia entre ellos (algunos usan prefijo `/v1`, otros
+no) y puede cambiar con el tiempo:
+
+```java
+providerRegistry.register(OpenAiCompatibleProvider.custom(
+        "kimi", "https://api.moonshot.ai/v1", System.getenv("AEGIS4J_KIMI_API_KEY")
+));
+
+engine.chat(ChatRequest.builder()
+        .providerId("kimi")
+        .model("kimi-latest")
+        .userInput("explicá qué es pgvector")
+        .build());
+```
+
+`baseUrl` debe incluir todo hasta (pero sin incluir) `/chat/completions` —
+ej: `https://api.openai.com/v1` para OpenAI, `https://api.deepseek.com` para
+DeepSeek (sin `/v1`).
+
 ## Creando una skill declarativa
 
 Creá un archivo `.md` con un bloque de frontmatter YAML:
@@ -290,6 +413,8 @@ hasta v0.3).
 | `aegis4j-skills`                 | `MarkdownSkillLoader`                                                |
 | `aegis4j-provider-http-support`  | Plumbing HTTP compartido entre providers                            |
 | `aegis4j-provider-ollama`        | `Provider` para Ollama                                               |
+| `aegis4j-provider-openai`         | `OpenAiCompatibleProvider` — OpenAI, DeepSeek, Kimi/Moonshot, etc.  |
+| `aegis4j-provider-anthropic`      | `Provider` para Anthropic (Messages API)                            |
 | `aegis4j-server`                 | Sidecar HTTP (Javalin)                                                |
 | `aegis4j-testkit`                | `FakeProvider`, `FakeRetriever` y helpers de prueba                  |
 | `aegis4j-mcp`                     | Cliente MCP (`McpClient`, transportes stdio y HTTP/SSE)              |
@@ -310,11 +435,12 @@ incondicional en el prompt cuando hay un `Retriever` configurado;
 enrutamiento de modelo vía `ModelRouter` — reglas programáticas
 (`KeywordRoutingRule`, `RegexRoutingRule`) y declarativas (`routing.yaml`),
 resueltas por campo (`providerId`/`model` independientes), un valor explícito
-siempre gana sobre uno enrutado.
+siempre gana sobre uno enrutado; `AnthropicProvider` (Messages API) y
+`OpenAiCompatibleProvider` (cubre OpenAI, DeepSeek, Kimi/Moonshot y cualquier
+otro backend compatible con la API de Chat Completions de OpenAI).
 
 Fuera de alcance por ahora (planeado para v0.3+):
 
-- Providers de Anthropic y OpenAI
 - Streaming SSE en el server (el engine ya soporta `chatStream`, pero el
   server todavía no lo retransmite vía SSE)
 - Skills programáticas registradas en el server, persona
