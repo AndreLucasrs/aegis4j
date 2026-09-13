@@ -370,6 +370,56 @@ prompt; el cuerpo solo se lee del disco y se inyecta cuando uno de los
 
 ## RAG/retrieval
 
+**Vector stores mapeados hoy**: nativamente (con cliente propio, JDBC
+directo), solo **pgvector**. Eso no es una limitación fuerte, porque
+`Retriever` es el único punto de contacto del engine — hay tres caminos para
+usar cualquier otro backend sin tocar el engine:
+
+1. **`PgVectorRetriever`** — JDBC directo contra Postgres+pgvector.
+2. **`McpToolRetriever`** — delega a la tool de búsqueda de **cualquier
+   servidor MCP**. Si el vector store que querés (Qdrant, Weaviate, Pinecone,
+   Chroma, Milvus, ...) ya tiene un servidor MCP publicado (o escribís un
+   wrapper fino que expone una tool `search`), ya funciona hoy, sin ninguna
+   línea de código nueva en Aegis4J.
+3. **Tu propio `Retriever`** — implementá la interfaz (2 métodos)
+   directamente contra el cliente/SDK que ya usás. Del mismo tamaño que
+   escribir el `PgVectorRetriever`.
+
+```mermaid
+flowchart TB
+    subgraph Pipeline["Dentro de Aegis4jEngine.chat()"]
+        Input(["userInput"]) --> GuardIn["GuardChain (input)"]
+        GuardIn --> Decision{"¿Retriever\nconfigurado?"}
+        Decision -- no --> Assemble
+        Decision -- sí --> Retrieve["retriever.retrieve(query, topK)"]
+        Retrieve --> Assemble["PromptAssembler\ninyecta bloque Context:"]
+        Assemble --> ProviderCall["Provider.complete() / stream()"]
+    end
+
+    Retrieve -. implementa .-> RetrieverIface{{"Retriever\n(interfaz, aegis4j-api)"}}
+
+    subgraph Backends["Backends de retrieval — disponibles hoy"]
+        RetrieverIface --> PgVector["PgVectorRetriever\naegis4j-rag-jdbc-pgvector"]
+        RetrieverIface --> McpRetriever["McpToolRetriever\naegis4j-rag-mcp"]
+        RetrieverIface --> Custom["Tu propio Retriever\n(bring your own)"]
+
+        PgVector -->|"JDBC directo"| Postgres[("Postgres\n+ pgvector")]
+
+        McpRetriever --> McpClientBox["McpClient\naegis4j-mcp"]
+        McpClientBox -->|"stdio o HTTP/SSE"| McpServer{{"Cualquier servidor MCP"}}
+        McpServer --> Pinecone[("Pinecone*")]
+        McpServer --> Qdrant[("Qdrant*")]
+        McpServer --> Weaviate[("Weaviate*")]
+        McpServer --> OutroMcp[("... cualquier otro\ncon servidor MCP")]
+
+        Custom -->|"lo implementás vos"| QualquerOutro[("Chroma, Milvus,\nElasticsearch, ...")]
+    end
+```
+
+<sup>* si ese vector store ya tiene (o construís) un servidor MCP con una
+tool de búsqueda — confirmá en la documentación actual de cada uno, esto
+cambia con el tiempo.</sup>
+
 ```java
 // vía pgvector directo (JDBC) — el Embedder debe ser provisto por quien usa la librería (ver limitaciones)
 Retriever pgvectorRetriever = new PgVectorRetriever(dataSource, embedder, PgVectorRetrieverConfig.defaults("document_chunks"));
