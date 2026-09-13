@@ -305,6 +305,52 @@ engine.chat(ChatRequest.builder()
 ej: `https://api.openai.com/v1` para OpenAI, `https://api.deepseek.com` para
 DeepSeek (sin `/v1`).
 
+### Circuit breaker / resiliencia
+
+Aegis4J no incluye circuit breaker — cada `Provider`/`McpTransport`/
+`PgVectorRetriever` solo tiene un `Duration timeout` explícito por llamada,
+lo que ya evita quedarse esperando indefinidamente en una llamada individual,
+pero no evita repetir el intento contra un servicio que ya se sabe caído.
+Esto es deliberado: el umbral de fallo, el tiempo de half-open y qué cuenta
+como "fallo" son decisiones de política que varían según el entorno, y mucha
+gente ya corre Resilience4j, service mesh o health-checks de load balancer —
+un circuit breaker interno solo competiría con eso.
+
+Como `Provider` es solo una interfaz, podés envolverla con lo que ya usás,
+sin tocar la librería. Ejemplo con
+[Resilience4j](https://resilience4j.readme.io/):
+
+```java
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+        .failureRateThreshold(50)
+        .waitDurationInOpenState(Duration.ofSeconds(30))
+        .slidingWindowSize(10)
+        .build();
+CircuitBreaker circuitBreaker = CircuitBreaker.of("ollama", config);
+
+Provider delegate = OllamaProvider.create();
+Provider resilientProvider = new Provider() {
+    @Override public String id() { return delegate.id(); }
+    @Override public CompletionResponse complete(CompletionRequest request) {
+        return circuitBreaker.executeSupplier(() -> delegate.complete(request));
+    }
+    @Override public Stream<CompletionChunk> stream(CompletionRequest request) {
+        return circuitBreaker.executeSupplier(() -> delegate.stream(request));
+    }
+    @Override public List<ModelInfo> listModels() {
+        return circuitBreaker.executeSupplier(delegate::listModels);
+    }
+};
+
+providerRegistry.register(resilientProvider);
+```
+
+Con el circuito abierto, `executeSupplier` lanza `CallNotPermittedException`
+(unchecked) — se propaga a través de `Aegis4jEngine.chat()` igual que ya
+propaga una `ProviderException` hoy, sin necesitar tratamiento especial en
+el engine. El mismo patrón de decorator funciona para `Retriever` y
+`McpTransport`.
+
 ## Creando una skill declarativa
 
 Creá un archivo `.md` con un bloque de frontmatter YAML:

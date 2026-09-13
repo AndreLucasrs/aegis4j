@@ -302,6 +302,50 @@ engine.chat(ChatRequest.builder()
 `https://api.openai.com/v1` para OpenAI, `https://api.deepseek.com` para
 DeepSeek (sem `/v1`).
 
+### Circuit breaker / resiliência
+
+O Aegis4J não embute circuit breaker — cada `Provider`/`McpTransport`/
+`PgVectorRetriever` só tem um `Duration timeout` explícito por chamada, o que
+já evita ficar esperando indefinidamente numa chamada individual, mas não
+evita repetir a tentativa contra um serviço que já se sabe fora. Isso é
+proposital: threshold de falha, tempo de half-open e o que conta como "falha"
+são decisões de política que variam por ambiente, e muita gente já roda
+Resilience4j, service mesh ou health-check de load balancer — um circuit
+breaker interno só competiria com isso.
+
+Como `Provider` é só uma interface, dá pra envolver com o que você já usa
+sem tocar na lib. Exemplo com [Resilience4j](https://resilience4j.readme.io/):
+
+```java
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+        .failureRateThreshold(50)
+        .waitDurationInOpenState(Duration.ofSeconds(30))
+        .slidingWindowSize(10)
+        .build();
+CircuitBreaker circuitBreaker = CircuitBreaker.of("ollama", config);
+
+Provider delegate = OllamaProvider.create();
+Provider resilientProvider = new Provider() {
+    @Override public String id() { return delegate.id(); }
+    @Override public CompletionResponse complete(CompletionRequest request) {
+        return circuitBreaker.executeSupplier(() -> delegate.complete(request));
+    }
+    @Override public Stream<CompletionChunk> stream(CompletionRequest request) {
+        return circuitBreaker.executeSupplier(() -> delegate.stream(request));
+    }
+    @Override public List<ModelInfo> listModels() {
+        return circuitBreaker.executeSupplier(delegate::listModels);
+    }
+};
+
+providerRegistry.register(resilientProvider);
+```
+
+Com o circuito aberto, `executeSupplier` lança `CallNotPermittedException`
+(unchecked) — propaga pelo `Aegis4jEngine.chat()` do mesmo jeito que uma
+`ProviderException` já propaga hoje, sem precisar de tratamento especial no
+engine. O mesmo padrão de decorator funciona pra `Retriever` e `McpTransport`.
+
 ## Criando uma skill declarativa
 
 Crie um arquivo `.md` com frontmatter YAML:

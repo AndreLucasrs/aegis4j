@@ -300,6 +300,51 @@ engine.chat(ChatRequest.builder()
 `/chat/completions` — e.g. `https://api.openai.com/v1` for OpenAI,
 `https://api.deepseek.com` for DeepSeek (no `/v1`).
 
+### Circuit breaker / resilience
+
+Aegis4J doesn't ship a circuit breaker — every `Provider`/`McpTransport`/
+`PgVectorRetriever` only has an explicit per-call `Duration timeout`, which
+already prevents hanging indefinitely on one call but doesn't prevent
+retrying a service that's already known to be down. This is deliberate:
+failure threshold, half-open timing, and what counts as a "failure" are
+policy decisions that vary by deployment, and plenty of setups already run
+Resilience4j, a service mesh, or load-balancer health checks — an internal
+circuit breaker would just compete with that.
+
+Since `Provider` is just an interface, you can wrap it with whatever you
+already use, without touching the library. Example with
+[Resilience4j](https://resilience4j.readme.io/):
+
+```java
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+        .failureRateThreshold(50)
+        .waitDurationInOpenState(Duration.ofSeconds(30))
+        .slidingWindowSize(10)
+        .build();
+CircuitBreaker circuitBreaker = CircuitBreaker.of("ollama", config);
+
+Provider delegate = OllamaProvider.create();
+Provider resilientProvider = new Provider() {
+    @Override public String id() { return delegate.id(); }
+    @Override public CompletionResponse complete(CompletionRequest request) {
+        return circuitBreaker.executeSupplier(() -> delegate.complete(request));
+    }
+    @Override public Stream<CompletionChunk> stream(CompletionRequest request) {
+        return circuitBreaker.executeSupplier(() -> delegate.stream(request));
+    }
+    @Override public List<ModelInfo> listModels() {
+        return circuitBreaker.executeSupplier(delegate::listModels);
+    }
+};
+
+providerRegistry.register(resilientProvider);
+```
+
+With the circuit open, `executeSupplier` throws `CallNotPermittedException`
+(unchecked) — it propagates through `Aegis4jEngine.chat()` the same way a
+`ProviderException` already does today, no special handling needed in the
+engine. The same decorator pattern works for `Retriever` and `McpTransport`.
+
 ## Creating a declarative skill
 
 Create a `.md` file with a YAML frontmatter block:
