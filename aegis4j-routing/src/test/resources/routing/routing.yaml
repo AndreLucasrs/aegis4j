@@ -1,0 +1,12 @@
+rules:
+  - match:
+      keyword: [code, bug, refactor]
+    provider: ollama
+    model: qwen2.5-coder:7b
+  - match:
+      regex: "(?i)\\b(sql|database)\\b"
+    provider: ollama
+    model: qwen2.5-coder:7b
+default:
+  provider: ollama
+  model: llama3.1:8b
