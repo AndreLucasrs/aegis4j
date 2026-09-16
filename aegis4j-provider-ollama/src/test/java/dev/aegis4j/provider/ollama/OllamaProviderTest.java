@@ -59,6 +59,25 @@ class OllamaProviderTest {
     }
 
     @Test
+    void completeIgnoresThinkingFieldFromReasoningModels() {
+        // "Thinking" models (e.g. deepseek-r1) add a "thinking" field carrying
+        // chain-of-thought alongside "content" — must not break parsing.
+        wireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"model":"deepseek-r1:14b","message":{"role":"assistant","thinking":"reasoning...","content":"the answer"},"done":true}
+                        """)));
+
+        CompletionResponse response = provider.complete(CompletionRequest.builder()
+                .model("deepseek-r1:14b")
+                .messages(List.of(Message.user("hi")))
+                .build());
+
+        assertThat(response.content()).isEqualTo("the answer");
+    }
+
+    @Test
     void streamConcatenatesDeltasAndEndsWithDone() {
         wireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
                 .withStatus(200)
