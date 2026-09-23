@@ -10,7 +10,6 @@ import dev.aegis4j.api.rag.RetrievedChunk;
 import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.api.routing.RoutingContext;
-import dev.aegis4j.api.skill.Skill;
 import dev.aegis4j.core.guard.GuardChain;
 import dev.aegis4j.core.persona.PersonaManager;
 import dev.aegis4j.core.prompt.PromptAssembler;
@@ -38,6 +37,7 @@ public final class Aegis4jEngine {
     private final GuardChain guardChain;
     private final SkillRegistry skillRegistry;
     private final SkillActivationStrategy activationStrategy;
+    private final boolean includeSkillCatalogInSystemPrompt;
     private final PersonaManager personaManager;
     private final Retriever retriever;
     private final ModelRouter modelRouter;
@@ -48,6 +48,9 @@ public final class Aegis4jEngine {
         this.guardChain = builder.guardChain;
         this.skillRegistry = builder.skillRegistry;
         this.activationStrategy = builder.activationStrategy;
+        this.includeSkillCatalogInSystemPrompt = builder.skillCatalogInSystemPrompt != null
+                ? builder.skillCatalogInSystemPrompt
+                : builder.activationStrategy.includeCatalogInSystemPrompt();
         this.personaManager = builder.personaManager;
         this.retriever = builder.retriever;
         this.modelRouter = builder.modelRouter;
@@ -68,6 +71,7 @@ public final class Aegis4jEngine {
                 personaManager.active(),
                 skillRegistry,
                 activationStrategy,
+                includeSkillCatalogInSystemPrompt,
                 retrievedChunks,
                 request.history(),
                 sanitizedInput
@@ -113,6 +117,7 @@ public final class Aegis4jEngine {
                 personaManager.active(),
                 skillRegistry,
                 activationStrategy,
+                includeSkillCatalogInSystemPrompt,
                 retrievedChunks,
                 request.history(),
                 sanitizedInput
@@ -210,9 +215,10 @@ public final class Aegis4jEngine {
          * {@link SkillActivationStrategy#includeCatalogInSystemPrompt()}.
          * Not calling this leaves that decision to the strategy (which
          * defaults to {@code true}), so existing behavior is unchanged
-         * unless a consumer opts out explicitly. Safe to call before or
-         * after {@link #activationStrategy}, since the override is applied
-         * to whichever strategy is in place at {@link #build()} time.
+         * unless a consumer opts out explicitly. Resolved once at
+         * {@link #build()} time, so this is safe to call before or after
+         * {@link #activationStrategy} and safe to call repeatedly on a
+         * reused {@code Builder}.
          */
         public Builder skillCatalogInSystemPrompt(boolean include) {
             this.skillCatalogInSystemPrompt = include;
@@ -241,21 +247,6 @@ public final class Aegis4jEngine {
         }
 
         public Aegis4jEngine build() {
-            if (skillCatalogInSystemPrompt != null) {
-                SkillActivationStrategy delegate = this.activationStrategy;
-                boolean include = skillCatalogInSystemPrompt;
-                this.activationStrategy = new SkillActivationStrategy() {
-                    @Override
-                    public List<Skill> activate(SkillRegistry registry, String userInput) {
-                        return delegate.activate(registry, userInput);
-                    }
-
-                    @Override
-                    public boolean includeCatalogInSystemPrompt() {
-                        return include;
-                    }
-                };
-            }
             return new Aegis4jEngine(this);
         }
     }

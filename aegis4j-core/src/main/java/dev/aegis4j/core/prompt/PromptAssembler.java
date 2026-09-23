@@ -13,13 +13,13 @@ import java.util.List;
 
 /**
  * Builds the final message list sent to a provider: persona prefix, then the
- * skill catalog (name + description only, when
- * {@link SkillActivationStrategy#includeCatalogInSystemPrompt()} says so),
- * then the full body of any skill activated for this specific turn, then any
- * retrieved RAG context, then conversation history, then the user's turn.
- * Activated skill bodies and retrieved chunks are appended fresh every call
- * and are never cached back into the catalog. Pure/no I/O — the engine
- * resolves {@code retrievedChunks} before calling this.
+ * skill catalog (name + description only, when {@code includeSkillCatalog}
+ * says so), then the full body of any skill activated for this specific
+ * turn, then any retrieved RAG context, then conversation history, then the
+ * user's turn. Activated skill bodies and retrieved chunks are appended
+ * fresh every call and are never cached back into the catalog. Pure/no I/O —
+ * the engine resolves {@code retrievedChunks} and {@code includeSkillCatalog}
+ * before calling this.
  */
 public final class PromptAssembler {
 
@@ -27,13 +27,14 @@ public final class PromptAssembler {
             Persona persona,
             SkillRegistry skillRegistry,
             SkillActivationStrategy activationStrategy,
+            boolean includeSkillCatalog,
             List<RetrievedChunk> retrievedChunks,
             List<Message> history,
             String userInput
     ) {
         List<Message> messages = new ArrayList<>();
 
-        String systemPrompt = buildSystemPrompt(persona, skillRegistry, activationStrategy);
+        String systemPrompt = buildSystemPrompt(persona, skillRegistry, includeSkillCatalog);
         if (!systemPrompt.isBlank()) {
             messages.add(Message.system(systemPrompt));
         }
@@ -59,13 +60,13 @@ public final class PromptAssembler {
         return context.toString().stripTrailing();
     }
 
-    private String buildSystemPrompt(Persona persona, SkillRegistry skillRegistry, SkillActivationStrategy activationStrategy) {
+    private String buildSystemPrompt(Persona persona, SkillRegistry skillRegistry, boolean includeSkillCatalog) {
         StringBuilder sb = new StringBuilder();
         if (persona != null && !persona.systemPromptPrefix().isBlank()) {
             sb.append(persona.systemPromptPrefix()).append("\n\n");
         }
 
-        if (activationStrategy.includeCatalogInSystemPrompt()) {
+        if (includeSkillCatalog) {
             List<SkillDescriptor> descriptors = skillRegistry.listDescriptors();
             if (!descriptors.isEmpty()) {
                 sb.append("Available skills:\n");
