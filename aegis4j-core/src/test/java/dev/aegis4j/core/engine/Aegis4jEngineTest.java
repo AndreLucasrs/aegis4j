@@ -23,9 +23,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class Aegis4jEngineTest {
 
-    @Test
-    void injectsSkillBodyOnlyWhenTriggerKeywordPresent() {
-        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+    private static SkillRegistry weatherSkillRegistry() {
         SkillRegistry skillRegistry = SkillRegistry.inMemory();
         skillRegistry.register(new ProgrammaticSkill(
                 new SkillDescriptor("weather-explainer", "Explains weather concepts", List.of("weather", "forecast"))
@@ -35,6 +33,13 @@ class Aegis4jEngineTest {
                 return "FULL SKILL BODY";
             }
         });
+        return skillRegistry;
+    }
+
+    @Test
+    void injectsSkillBodyOnlyWhenTriggerKeywordPresent() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        SkillRegistry skillRegistry = weatherSkillRegistry();
 
         Aegis4jEngine engine = Aegis4jEngine.builder()
                 .provider(provider)
@@ -51,6 +56,71 @@ class Aegis4jEngineTest {
 
         assertThat(provider.lastRequest().messages().toString()).doesNotContain("FULL SKILL BODY");
         assertThat(provider.lastRequest().messages().toString()).contains("weather-explainer");
+    }
+
+    @Test
+    void skillCatalogIsPresentByDefaultEvenWithoutActivation() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        SkillRegistry skillRegistry = weatherSkillRegistry();
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .skillRegistry(skillRegistry)
+                .build();
+
+        engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("unrelated question").build());
+
+        assertThat(provider.lastRequest().messages().toString())
+                .contains("Available skills")
+                .contains("weather-explainer")
+                .doesNotContain("FULL SKILL BODY");
+    }
+
+    @Test
+    void skillCatalogCanBeExcludedFromSystemPromptViaBuilderOption() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        SkillRegistry skillRegistry = weatherSkillRegistry();
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .skillRegistry(skillRegistry)
+                .skillCatalogInSystemPrompt(false)
+                .build();
+
+        engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("unrelated question").build());
+
+        assertThat(provider.lastRequest().messages().toString())
+                .doesNotContain("Available skills")
+                .doesNotContain("weather-explainer");
+
+        engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("what is the weather like").build());
+
+        assertThat(provider.lastRequest().messages().toString())
+                .doesNotContain("Available skills")
+                .contains("FULL SKILL BODY");
+    }
+
+    @Test
+    void builderIsReusableAcrossMultipleBuildCalls() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        SkillRegistry skillRegistry = weatherSkillRegistry();
+
+        Aegis4jEngine.Builder builder = Aegis4jEngine.builder()
+                .provider(provider)
+                .skillRegistry(skillRegistry)
+                .skillCatalogInSystemPrompt(false);
+
+        Aegis4jEngine first = builder.build();
+        Aegis4jEngine second = builder.build();
+
+        first.chat(ChatRequest.builder().providerId("fake").model("m").userInput("unrelated question").build());
+        assertThat(provider.lastRequest().messages().toString()).doesNotContain("Available skills");
+
+        second.chat(ChatRequest.builder().providerId("fake").model("m").userInput("unrelated question").build());
+        assertThat(provider.lastRequest().messages().toString()).doesNotContain("Available skills");
     }
 
     @Test

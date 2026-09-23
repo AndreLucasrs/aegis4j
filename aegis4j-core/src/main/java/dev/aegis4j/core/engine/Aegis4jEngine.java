@@ -37,6 +37,7 @@ public final class Aegis4jEngine {
     private final GuardChain guardChain;
     private final SkillRegistry skillRegistry;
     private final SkillActivationStrategy activationStrategy;
+    private final boolean includeSkillCatalogInSystemPrompt;
     private final PersonaManager personaManager;
     private final Retriever retriever;
     private final ModelRouter modelRouter;
@@ -47,6 +48,9 @@ public final class Aegis4jEngine {
         this.guardChain = builder.guardChain;
         this.skillRegistry = builder.skillRegistry;
         this.activationStrategy = builder.activationStrategy;
+        this.includeSkillCatalogInSystemPrompt = builder.skillCatalogInSystemPrompt != null
+                ? builder.skillCatalogInSystemPrompt
+                : builder.activationStrategy.includeCatalogInSystemPrompt();
         this.personaManager = builder.personaManager;
         this.retriever = builder.retriever;
         this.modelRouter = builder.modelRouter;
@@ -67,6 +71,7 @@ public final class Aegis4jEngine {
                 personaManager.active(),
                 skillRegistry,
                 activationStrategy,
+                includeSkillCatalogInSystemPrompt,
                 retrievedChunks,
                 request.history(),
                 sanitizedInput
@@ -112,6 +117,7 @@ public final class Aegis4jEngine {
                 personaManager.active(),
                 skillRegistry,
                 activationStrategy,
+                includeSkillCatalogInSystemPrompt,
                 retrievedChunks,
                 request.history(),
                 sanitizedInput
@@ -175,6 +181,7 @@ public final class Aegis4jEngine {
         private PersonaManager personaManager = PersonaManager.none();
         private Retriever retriever;
         private ModelRouter modelRouter;
+        private Boolean skillCatalogInSystemPrompt;
 
         public Builder providerRegistry(ProviderRegistry providerRegistry) {
             this.providerRegistry = providerRegistry;
@@ -198,6 +205,23 @@ public final class Aegis4jEngine {
 
         public Builder activationStrategy(SkillActivationStrategy activationStrategy) {
             this.activationStrategy = activationStrategy;
+            return this;
+        }
+
+        /**
+         * Overrides whether the skill catalog (name + description of every
+         * registered skill) is listed in the system prompt on every turn,
+         * regardless of the configured {@link SkillActivationStrategy}'s own
+         * {@link SkillActivationStrategy#includeCatalogInSystemPrompt()}.
+         * Not calling this leaves that decision to the strategy (which
+         * defaults to {@code true}), so existing behavior is unchanged
+         * unless a consumer opts out explicitly. Resolved once at
+         * {@link #build()} time, so this is safe to call before or after
+         * {@link #activationStrategy} and safe to call repeatedly on a
+         * reused {@code Builder}.
+         */
+        public Builder skillCatalogInSystemPrompt(boolean include) {
+            this.skillCatalogInSystemPrompt = include;
             return this;
         }
 
