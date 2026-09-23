@@ -54,6 +54,67 @@ class Aegis4jEngineTest {
     }
 
     @Test
+    void skillCatalogIsPresentByDefaultEvenWithoutActivation() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        SkillRegistry skillRegistry = SkillRegistry.inMemory();
+        skillRegistry.register(new ProgrammaticSkill(
+                new SkillDescriptor("weather-explainer", "Explains weather concepts", List.of("weather", "forecast"))
+        ) {
+            @Override
+            public String body() {
+                return "FULL SKILL BODY";
+            }
+        });
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .skillRegistry(skillRegistry)
+                .build();
+
+        engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("unrelated question").build());
+
+        assertThat(provider.lastRequest().messages().toString())
+                .contains("Available skills")
+                .contains("weather-explainer")
+                .doesNotContain("FULL SKILL BODY");
+    }
+
+    @Test
+    void skillCatalogCanBeExcludedFromSystemPromptViaBuilderOption() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        SkillRegistry skillRegistry = SkillRegistry.inMemory();
+        skillRegistry.register(new ProgrammaticSkill(
+                new SkillDescriptor("weather-explainer", "Explains weather concepts", List.of("weather", "forecast"))
+        ) {
+            @Override
+            public String body() {
+                return "FULL SKILL BODY";
+            }
+        });
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .skillRegistry(skillRegistry)
+                .skillCatalogInSystemPrompt(false)
+                .build();
+
+        engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("unrelated question").build());
+
+        assertThat(provider.lastRequest().messages().toString())
+                .doesNotContain("Available skills")
+                .doesNotContain("weather-explainer");
+
+        engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("what is the weather like").build());
+
+        assertThat(provider.lastRequest().messages().toString())
+                .doesNotContain("Available skills")
+                .contains("FULL SKILL BODY");
+    }
+
+    @Test
     void runsInputAndOutputGuardChain() {
         FakeProvider provider = FakeProvider.withId("fake").respondingWith("secret is abc123");
         Guard redactingGuard = new Guard() {

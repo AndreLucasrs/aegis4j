@@ -10,6 +10,7 @@ import dev.aegis4j.api.rag.RetrievedChunk;
 import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.api.routing.RoutingContext;
+import dev.aegis4j.api.skill.Skill;
 import dev.aegis4j.core.guard.GuardChain;
 import dev.aegis4j.core.persona.PersonaManager;
 import dev.aegis4j.core.prompt.PromptAssembler;
@@ -175,6 +176,7 @@ public final class Aegis4jEngine {
         private PersonaManager personaManager = PersonaManager.none();
         private Retriever retriever;
         private ModelRouter modelRouter;
+        private Boolean skillCatalogInSystemPrompt;
 
         public Builder providerRegistry(ProviderRegistry providerRegistry) {
             this.providerRegistry = providerRegistry;
@@ -201,6 +203,22 @@ public final class Aegis4jEngine {
             return this;
         }
 
+        /**
+         * Overrides whether the skill catalog (name + description of every
+         * registered skill) is listed in the system prompt on every turn,
+         * regardless of the configured {@link SkillActivationStrategy}'s own
+         * {@link SkillActivationStrategy#includeCatalogInSystemPrompt()}.
+         * Not calling this leaves that decision to the strategy (which
+         * defaults to {@code true}), so existing behavior is unchanged
+         * unless a consumer opts out explicitly. Safe to call before or
+         * after {@link #activationStrategy}, since the override is applied
+         * to whichever strategy is in place at {@link #build()} time.
+         */
+        public Builder skillCatalogInSystemPrompt(boolean include) {
+            this.skillCatalogInSystemPrompt = include;
+            return this;
+        }
+
         public Builder persona(Persona persona) {
             this.personaManager = new PersonaManager(persona);
             return this;
@@ -223,6 +241,21 @@ public final class Aegis4jEngine {
         }
 
         public Aegis4jEngine build() {
+            if (skillCatalogInSystemPrompt != null) {
+                SkillActivationStrategy delegate = this.activationStrategy;
+                boolean include = skillCatalogInSystemPrompt;
+                this.activationStrategy = new SkillActivationStrategy() {
+                    @Override
+                    public List<Skill> activate(SkillRegistry registry, String userInput) {
+                        return delegate.activate(registry, userInput);
+                    }
+
+                    @Override
+                    public boolean includeCatalogInSystemPrompt() {
+                        return include;
+                    }
+                };
+            }
             return new Aegis4jEngine(this);
         }
     }

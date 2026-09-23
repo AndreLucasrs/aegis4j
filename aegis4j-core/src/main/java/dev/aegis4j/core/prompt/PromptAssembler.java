@@ -13,12 +13,13 @@ import java.util.List;
 
 /**
  * Builds the final message list sent to a provider: persona prefix, then the
- * always-on skill catalog (name + description only), then the full body of
- * any skill activated for this specific turn, then any retrieved RAG
- * context, then conversation history, then the user's turn. Activated skill
- * bodies and retrieved chunks are appended fresh every call and are never
- * cached back into the catalog. Pure/no I/O — the engine resolves
- * {@code retrievedChunks} before calling this.
+ * skill catalog (name + description only, when
+ * {@link SkillActivationStrategy#includeCatalogInSystemPrompt()} says so),
+ * then the full body of any skill activated for this specific turn, then any
+ * retrieved RAG context, then conversation history, then the user's turn.
+ * Activated skill bodies and retrieved chunks are appended fresh every call
+ * and are never cached back into the catalog. Pure/no I/O — the engine
+ * resolves {@code retrievedChunks} before calling this.
  */
 public final class PromptAssembler {
 
@@ -32,7 +33,7 @@ public final class PromptAssembler {
     ) {
         List<Message> messages = new ArrayList<>();
 
-        String systemPrompt = buildSystemPrompt(persona, skillRegistry);
+        String systemPrompt = buildSystemPrompt(persona, skillRegistry, activationStrategy);
         if (!systemPrompt.isBlank()) {
             messages.add(Message.system(systemPrompt));
         }
@@ -58,17 +59,19 @@ public final class PromptAssembler {
         return context.toString().stripTrailing();
     }
 
-    private String buildSystemPrompt(Persona persona, SkillRegistry skillRegistry) {
+    private String buildSystemPrompt(Persona persona, SkillRegistry skillRegistry, SkillActivationStrategy activationStrategy) {
         StringBuilder sb = new StringBuilder();
         if (persona != null && !persona.systemPromptPrefix().isBlank()) {
             sb.append(persona.systemPromptPrefix()).append("\n\n");
         }
 
-        List<SkillDescriptor> descriptors = skillRegistry.listDescriptors();
-        if (!descriptors.isEmpty()) {
-            sb.append("Available skills:\n");
-            for (SkillDescriptor descriptor : descriptors) {
-                sb.append("- ").append(descriptor.name()).append(": ").append(descriptor.description()).append('\n');
+        if (activationStrategy.includeCatalogInSystemPrompt()) {
+            List<SkillDescriptor> descriptors = skillRegistry.listDescriptors();
+            if (!descriptors.isEmpty()) {
+                sb.append("Available skills:\n");
+                for (SkillDescriptor descriptor : descriptors) {
+                    sb.append("- ").append(descriptor.name()).append(": ").append(descriptor.description()).append('\n');
+                }
             }
         }
 
