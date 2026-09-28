@@ -28,10 +28,10 @@ public final class FixedSizeChunker implements Chunker {
             return List.of();
         }
         List<String> chunks = new ArrayList<>();
-        int step = chunkSize - overlap;
-        for (int rawStart = 0; rawStart < text.length(); rawStart += step) {
-            int start = avoidSplittingSurrogatePair(text, rawStart);
-            int end = avoidSplittingSurrogatePair(text, Math.min(rawStart + chunkSize, text.length()));
+        int start = 0;
+        while (start < text.length()) {
+            start = avoidSplittingSurrogatePair(text, start);
+            int end = avoidSplittingSurrogatePair(text, Math.min(start + chunkSize, text.length()));
             if (end <= start) {
                 // Only reachable in pathological tiny-window cases; widen rather than emit an empty/invalid chunk.
                 end = Math.min(start + 2, text.length());
@@ -40,6 +40,17 @@ public final class FixedSizeChunker implements Chunker {
             if (end == text.length()) {
                 break;
             }
+            // Derive the next start from THIS chunk's actual (possibly surrogate-adjusted) end,
+            // never from a fixed step off the original raw index. Deriving it from the raw index
+            // instead let the surrogate-pair adjustment nudge this chunk's start backwards past the
+            // previous chunk's end, so the next raw start (computed independently) could re-emit the
+            // same window the previous iteration already produced.
+            int nextStart = end - overlap;
+            if (nextStart <= start) {
+                // Guarantee forward progress even when overlap/widening would otherwise stall or rewind.
+                nextStart = start + 1;
+            }
+            start = nextStart;
         }
         return List.copyOf(chunks);
     }
@@ -48,9 +59,10 @@ public final class FixedSizeChunker implements Chunker {
      * Nudges a split index one character left when it falls between a high
      * and low surrogate, so a chunk boundary never cuts a UTF-16 surrogate
      * pair (e.g. an emoji or other non-BMP character) in half — Postgres
-     * rejects the resulting invalid byte sequence outright. Applying this to
-     * every raw boundary keeps adjacent chunks gap-free and duplicate-free,
-     * since the same raw index always maps to the same adjusted index.
+     * rejects the resulting invalid byte sequence outright. Because each
+     * chunk's start is derived from the previous chunk's actual (adjusted)
+     * end rather than from an independently-adjusted raw index, adjacent
+     * chunks stay gap-free and duplicate-free even across surrogate pairs.
      */
     private static int avoidSplittingSurrogatePair(String text, int index) {
         if (index > 0 && index < text.length()
