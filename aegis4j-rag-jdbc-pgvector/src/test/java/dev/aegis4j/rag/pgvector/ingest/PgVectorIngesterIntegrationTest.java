@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.List;
 
@@ -86,5 +87,37 @@ class PgVectorIngesterIntegrationTest {
         assertThat(results.get(0).sourceId()).isEqualTo("postgres.txt#0");
         assertThat(results.get(0).content()).contains("Postgres");
         assertThat(results.get(0).score()).isGreaterThan(results.get(1).score());
+    }
+
+    @Test
+    void reingestingTheSameDocumentUpsertsInsteadOfFailingOnDuplicateKey(@TempDir Path directory) throws Exception {
+        // Dedicated table so this test's rows never interact with ingestedDocumentsAreFoundByTheRetriever's.
+        String table = "reingest_chunks";
+        DataSource dataSource = dataSource();
+        try (Connection connection = dataSource.getConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE " + table + " (id text primary key, content text, embedding vector("
+                    + DIMENSIONS + "))");
+        }
+
+        Embedder embedder = new HashEmbedder(DIMENSIONS);
+        PgVectorRetrieverConfig config = PgVectorRetrieverConfig.defaults(table);
+        PgVectorIngester ingester = new PgVectorIngester(dataSource, embedder, config, new FixedSizeChunker(1000, 0));
+
+        Files.writeString(directory.resolve("doc.txt"), "first version of the content");
+        int firstChunkCount = ingester.ingest(new TextDocumentLoader(directory));
+        assertThat(firstChunkCount).isEqualTo(1);
+
+        // Same source file, changed content: a scheduled re-sync or retry, not a distinct document.
+        Files.writeString(directory.resolve("doc.txt"), "second version of the content");
+        int secondChunkCount = ingester.ingest(new TextDocumentLoader(directory));
+        assertThat(secondChunkCount).isEqualTo(1);
+
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement();
+             ResultSet resultSet = statement.executeQuery("SELECT count(*), max(content) FROM " + table)) {
+            assertThat(resultSet.next()).isTrue();
+            assertThat(resultSet.getInt(1)).isEqualTo(1);
+            assertThat(resultSet.getString(2)).isEqualTo("second version of the content");
+        }
     }
 }

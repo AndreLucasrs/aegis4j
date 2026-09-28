@@ -51,4 +51,30 @@ class FixedSizeChunkerTest {
         assertThatThrownBy(() -> new FixedSizeChunker(5, -1))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void rejectsNullText() {
+        FixedSizeChunker chunker = new FixedSizeChunker(5, 0);
+
+        assertThatThrownBy(() -> chunker.chunk(null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void neverSplitsASurrogatePairAcrossChunkBoundaries() {
+        // "abcd" + U+1F600 (a surrogate pair in UTF-16) + "efgh": with chunkSize=5,
+        // a naive char-index cut lands exactly between the pair's two chars.
+        String emoji = "😀";
+        String text = "abcd" + emoji + "efgh";
+        FixedSizeChunker chunker = new FixedSizeChunker(5, 0);
+
+        List<String> chunks = chunker.chunk(text);
+
+        assertThat(String.join("", chunks)).isEqualTo(text);
+        for (String chunk : chunks) {
+            assertThat(chunk.codePoints().count()).isGreaterThan(0);
+            assertThat(Character.isLowSurrogate(chunk.charAt(0))).isFalse();
+            assertThat(Character.isHighSurrogate(chunk.charAt(chunk.length() - 1))).isFalse();
+        }
+    }
 }

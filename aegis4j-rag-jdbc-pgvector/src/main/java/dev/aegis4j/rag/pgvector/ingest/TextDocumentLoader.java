@@ -8,9 +8,13 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /** Reads whole files matching an extension from a directory (non-recursive), one document per file. */
 public final class TextDocumentLoader implements DocumentLoader {
+
+    private static final Logger LOGGER = Logger.getLogger(TextDocumentLoader.class.getName());
 
     private final Path directory;
     private final String extension;
@@ -29,11 +33,18 @@ public final class TextDocumentLoader implements DocumentLoader {
         List<Document> documents = new ArrayList<>();
         try (DirectoryStream<Path> files = Files.newDirectoryStream(directory, "*" + extension)) {
             for (Path file : files) {
-                String content = Files.readString(file);
-                documents.add(new Document(file.getFileName().toString(), content, Map.of("path", file.toString())));
+                // Isolated per file: one unreadable entry (permissions, a directory that
+                // happens to match the glob, ...) must not discard every other document
+                // already read successfully from this directory.
+                try {
+                    String content = Files.readString(file);
+                    documents.add(new Document(file.getFileName().toString(), content, Map.of("path", file.toString())));
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Skipping unreadable file " + file, e);
+                }
             }
         } catch (IOException e) {
-            throw new UncheckedIOException("Failed to load documents from " + directory, e);
+            throw new UncheckedIOException("Failed to list documents in " + directory, e);
         }
         return List.copyOf(documents);
     }

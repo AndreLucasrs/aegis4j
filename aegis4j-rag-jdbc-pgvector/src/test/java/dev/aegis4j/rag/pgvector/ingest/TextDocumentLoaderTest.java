@@ -43,4 +43,18 @@ class TextDocumentLoaderTest {
 
         assertThat(documents).isEmpty();
     }
+
+    @Test
+    void skipsAnUnreadableEntryInsteadOfDiscardingTheWholeDirectory(@TempDir Path directory) throws IOException {
+        Files.writeString(directory.resolve("good.txt"), "readable content");
+        // A directory happens to match the "*.txt" glob; Files.readString on it throws.
+        // Loading must isolate that failure instead of losing "good.txt" too.
+        Files.createDirectory(directory.resolve("broken.txt"));
+
+        List<Document> documents = new TextDocumentLoader(directory).load();
+
+        assertThat(documents).hasSize(1);
+        assertThat(documents.get(0).id()).isEqualTo("good.txt");
+        assertThat(documents.get(0).content()).isEqualTo("readable content");
+    }
 }
