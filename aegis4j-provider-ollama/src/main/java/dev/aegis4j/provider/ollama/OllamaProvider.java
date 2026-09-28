@@ -25,7 +25,17 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Stream;
 
-/** {@link Provider} for a local (or remote) Ollama instance's {@code /api/chat} and {@code /api/tags} endpoints. */
+/**
+ * {@link Provider} for a local (or remote) Ollama instance's {@code /api/chat}
+ * and {@code /api/tags} endpoints.
+ *
+ * <p><b>Does not support tool calling yet:</b> {@link CompletionRequest#tools()}
+ * is silently ignored (never sent as part of the {@code /api/chat} request)
+ * and {@link #complete} always returns an empty {@code toolCalls()} list.
+ * Callers that configure {@code Aegis4jEngine.Builder.tools(...)} against
+ * this provider will never see a tool call trigger the engine's tool-calling
+ * loop, with no error or log to say so.
+ */
 public final class OllamaProvider implements Provider {
 
     public static final String ID = "ollama";

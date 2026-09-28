@@ -23,6 +23,7 @@ public final class FakeProvider implements Provider {
     private final String id;
     private final List<CompletionRequest> receivedRequests = new ArrayList<>();
     private Function<CompletionRequest, String> responder = request -> "fake response";
+    private Function<CompletionRequest, CompletionResponse> fullResponder;
 
     public FakeProvider(String id) {
         this.id = id;
@@ -34,11 +35,19 @@ public final class FakeProvider implements Provider {
 
     public FakeProvider respondingWith(String fixedResponse) {
         this.responder = request -> fixedResponse;
+        this.fullResponder = null;
         return this;
     }
 
     public FakeProvider respondingWith(Function<CompletionRequest, String> responder) {
         this.responder = responder;
+        this.fullResponder = null;
+        return this;
+    }
+
+    /** Full control over the returned {@link CompletionResponse} — needed to test tool calls, which {@link #respondingWith} can't express. */
+    public FakeProvider respondingWithFullResponse(Function<CompletionRequest, CompletionResponse> fullResponder) {
+        this.fullResponder = fullResponder;
         return this;
     }
 
@@ -58,6 +67,9 @@ public final class FakeProvider implements Provider {
     @Override
     public CompletionResponse complete(CompletionRequest request) {
         receivedRequests.add(request);
+        if (fullResponder != null) {
+            return fullResponder.apply(request);
+        }
         String content = responder.apply(request);
         return new CompletionResponse(
                 "fake-" + receivedRequests.size(), request.model(), content,
