@@ -1,8 +1,19 @@
 package dev.aegis4j.server;
 
+import com.fasterxml.jackson.core.JsonGenerationException;
+import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.JsonSerializer;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.github.tomakehurst.wiremock.WireMockServer;
+import dev.aegis4j.api.provider.CompletionChunk;
+import dev.aegis4j.api.provider.CompletionRequest;
+import dev.aegis4j.api.provider.CompletionResponse;
+import dev.aegis4j.api.provider.ModelInfo;
+import dev.aegis4j.api.provider.Provider;
 import dev.aegis4j.api.provider.ToolDefinition;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.core.engine.Aegis4jEngine;
@@ -14,6 +25,7 @@ import dev.aegis4j.guardrails.builtin.MaxLengthGuard;
 import dev.aegis4j.guardrails.builtin.RegexPiiGuard;
 import dev.aegis4j.provider.ollama.OllamaProvider;
 import dev.aegis4j.provider.openai.OpenAiCompatibleProvider;
+import dev.aegis4j.server.http.ChatCompletionsHandler;
 import dev.aegis4j.skills.markdown.MarkdownSkillLoader;
 import io.javalin.Javalin;
 import org.junit.jupiter.api.AfterEach;
@@ -283,6 +295,66 @@ class Aegis4jServerE2ETest {
         }
     }
 
+    /**
+     * A generic {@code ProviderException} (e.g. a 404 for an unknown model,
+     * which is neither auth nor rate-limit) used to be reported as a
+     * hardcoded 502 regardless of what the provider actually returned. Both
+     * the streaming and non-streaming paths now go through the same
+     * {@code ChatCompletionsHandler.mapError} lookup, so both must surface
+     * the provider's real status.
+     */
+    @Test
+    void nonStreamingProviderErrorSurfacesProvidersOwnHttpStatusInsteadOfHardcoded502() throws Exception {
+        wireMock.stubFor(post(urlEqualTo("/chat/completions")).willReturn(aResponse()
+                .withStatus(404)
+                .withBody("model 'gpt-does-not-exist' not found")));
+
+        OpenAiCompatibleProvider openAi = OpenAiCompatibleProvider.custom("openai-test", "http://localhost:" + wireMock.port(), "sk-test");
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(openAi);
+        Aegis4jEngine engine = Aegis4jEngine.builder().providerRegistry(providerRegistry).build();
+
+        Javalin providerErrorApp = Aegis4jServerApp.createApp(engine, "openai-test", null);
+        providerErrorApp.start(0);
+        try {
+            HttpResponse<String> response = postChatCompletion(providerErrorApp, null, """
+                    {"model":"gpt-does-not-exist","messages":[{"role":"user","content":"hi"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(404);
+            JsonNode body = mapper.readTree(response.body());
+            assertThat(body.at("/error/code").asText()).isEqualTo("provider_error");
+        } finally {
+            providerErrorApp.stop();
+        }
+    }
+
+    @Test
+    void streamingProviderErrorSurfacesProvidersOwnHttpStatusInsteadOfHardcoded502() throws Exception {
+        wireMock.stubFor(post(urlEqualTo("/chat/completions")).willReturn(aResponse()
+                .withStatus(404)
+                .withBody("model 'gpt-does-not-exist' not found")));
+
+        OpenAiCompatibleProvider openAi = OpenAiCompatibleProvider.custom("openai-test", "http://localhost:" + wireMock.port(), "sk-test");
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(openAi);
+        Aegis4jEngine engine = Aegis4jEngine.builder().providerRegistry(providerRegistry).build();
+
+        Javalin providerErrorApp = Aegis4jServerApp.createApp(engine, "openai-test", null);
+        providerErrorApp.start(0);
+        try {
+            HttpResponse<String> response = postChatCompletion(providerErrorApp, null, """
+                    {"model":"gpt-does-not-exist","messages":[{"role":"user","content":"hi"}],"stream":true}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(404);
+            JsonNode body = mapper.readTree(response.body());
+            assertThat(body.at("/error/code").asText()).isEqualTo("provider_error");
+        } finally {
+            providerErrorApp.stop();
+        }
+    }
+
     @Test
     void acceptsRequestWithMatchingBearerTokenWhenApiKeyConfigured() throws Exception {
         Javalin authApp = startAppWithApiKey("secret-key");
@@ -328,6 +400,37 @@ class Aegis4jServerE2ETest {
                             """))
                     .build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            assertThat(response.statusCode()).isEqualTo(400);
+            JsonNode body = mapper.readTree(response.body());
+            assertThat(body.at("/error/code").asText()).isEqualTo("unknown_provider");
+            assertThat(body.at("/error/message").asText()).contains("missing-provider");
+        } finally {
+            brokenApp.stop();
+        }
+    }
+
+    /**
+     * Before this fix, {@code ChatCompletionsHandler.handle()}'s non-streaming
+     * path only caught {@code GuardBlockedException}/{@code ToolCallLimitExceededException}:
+     * an unresolvable provider ({@code NoSuchElementException}) would have
+     * propagated out of the handler uncaught instead of producing this
+     * unified JSON error shape, unlike the streaming path right above.
+     */
+    @Test
+    void nonStreamingReturnsUnifiedJsonErrorWhenProviderUnresolvable() throws Exception {
+        ProviderRegistry emptyRegistry = new ProviderRegistry();
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .providerRegistry(emptyRegistry)
+                .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000)))
+                .build();
+
+        Javalin brokenApp = Aegis4jServerApp.createApp(engine, "missing-provider", null);
+        brokenApp.start(0);
+        try {
+            HttpResponse<String> response = postChatCompletion(brokenApp, null, """
+                    {"model":"llama3","messages":[{"role":"user","content":"hi"}]}
+                    """);
 
             assertThat(response.statusCode()).isEqualTo(400);
             JsonNode body = mapper.readTree(response.body());
@@ -388,6 +491,90 @@ class Aegis4jServerE2ETest {
         } finally {
             brokenApp.stop();
             brokenWireMock.stop();
+        }
+    }
+
+    /**
+     * {@code mapper.writeValueAsBytes(dto)} inside the SSE loop can throw the
+     * checked {@code JsonProcessingException} (a {@code JsonGenerationException}
+     * here, forced via a poisoned serializer) — before this fix the loop's
+     * {@code catch (RuntimeException e)} didn't cover it, so the stream would
+     * die without an error event and without {@code [DONE]}, leaving a
+     * client waiting forever. Uses a hand-built {@link ChatCompletionsHandler}
+     * (bypassing {@code Aegis4jServerApp}) so a mapper that fails on demand
+     * can be injected.
+     */
+    @Test
+    void streamingStillEmitsDoneEventWhenChunkSerializationFailsMidStream() throws Exception {
+        Provider poisonedContentProvider = new Provider() {
+            @Override
+            public String id() {
+                return "poison";
+            }
+
+            @Override
+            public CompletionResponse complete(CompletionRequest request) {
+                throw new UnsupportedOperationException("not used in this test");
+            }
+
+            @Override
+            public Stream<CompletionChunk> stream(CompletionRequest request) {
+                return Stream.of(
+                        CompletionChunk.ofDelta("hi"),
+                        CompletionChunk.ofDelta("TRIGGER_SERIALIZATION_FAILURE"),
+                        CompletionChunk.finished()
+                );
+            }
+
+            @Override
+            public List<ModelInfo> listModels() {
+                return List.of();
+            }
+        };
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(poisonedContentProvider);
+        Aegis4jEngine engine = Aegis4jEngine.builder().providerRegistry(providerRegistry).build();
+
+        ObjectMapper poisonedMapper = new ObjectMapper().setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+        SimpleModule poison = new SimpleModule();
+        poison.addSerializer(String.class, new JsonSerializer<String>() {
+            @Override
+            public void serialize(String value, JsonGenerator gen, SerializerProvider serializers) throws IOException {
+                if ("TRIGGER_SERIALIZATION_FAILURE".equals(value)) {
+                    throw new JsonGenerationException("forced serialization failure", gen);
+                }
+                gen.writeString(value);
+            }
+        });
+        poisonedMapper.registerModule(poison);
+
+        Javalin poisonedApp = Javalin.create();
+        poisonedApp.post("/v1/chat/completions", new ChatCompletionsHandler(engine, "poison", poisonedMapper));
+        poisonedApp.start(0);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + poisonedApp.port() + "/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""
+                            {"model":"poison-model","messages":[{"role":"user","content":"hi"}],"stream":true}
+                            """))
+                    .build();
+            HttpResponse<Stream<String>> response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+
+            assertThat(response.statusCode()).isEqualTo(200);
+
+            List<String> dataLines;
+            try (Stream<String> lines = response.body()) {
+                dataLines = lines.filter(line -> line.startsWith("data: ")).map(line -> line.substring("data: ".length())).toList();
+            }
+
+            // Response is committed to 200 before the poisoned chunk is reached, so
+            // the only observable proof of the failure is that [DONE] still arrives
+            // instead of the connection dying silently after the first good chunk.
+            assertThat(dataLines).isNotEmpty();
+            assertThat(dataLines.get(dataLines.size() - 1)).isEqualTo("[DONE]");
+        } finally {
+            poisonedApp.stop();
         }
     }
 
