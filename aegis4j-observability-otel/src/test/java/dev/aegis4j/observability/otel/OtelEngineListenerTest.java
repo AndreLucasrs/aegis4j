@@ -3,6 +3,7 @@ package dev.aegis4j.observability.otel;
 import dev.aegis4j.api.provider.CompletionResponse;
 import dev.aegis4j.api.provider.Usage;
 import dev.aegis4j.api.rag.RetrievedChunk;
+import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.core.engine.Aegis4jEngine;
 import dev.aegis4j.core.engine.ChatRequest;
 import dev.aegis4j.testkit.FakeProvider;
@@ -123,6 +124,68 @@ class OtelEngineListenerTest {
         List<String> eventNames = span.getEvents().stream().map(event -> event.getName()).toList();
         assertThat(eventNames).containsExactly("input_guard.complete", "route.resolved");
         assertThat(span.getStatus().getStatusCode()).isEqualTo(StatusCode.OK);
+    }
+
+    @Test
+    void survivesAReentrantChatCallOnTheSameThreadWithoutLosingTheOuterSpan() {
+        // Nothing in Guard/Provider/Retriever/ModelRouter's contracts rules out a
+        // custom component driving another engine.chat() call on the same thread
+        // from inside one of the pipeline's phases. Simulate that with a
+        // Retriever whose retrieve() itself calls an inner engine's chat().
+        OtelEngineListener listener = new OtelEngineListener(openTelemetry);
+
+        FakeProvider innerProvider = FakeProvider.withId("inner").respondingWith("inner response");
+        Aegis4jEngine innerEngine = Aegis4jEngine.builder()
+                .provider(innerProvider)
+                .listener(listener)
+                .build();
+
+        Retriever nestingRetriever = (query, topK) -> {
+            innerEngine.chat(ChatRequest.builder()
+                    .requestId("req-inner").providerId("inner").model("m-inner").userInput("nested").build());
+            return List.of();
+        };
+
+        FakeProvider outerProvider = FakeProvider.withId("outer").respondingWith("outer response");
+        Aegis4jEngine outerEngine = Aegis4jEngine.builder()
+                .provider(outerProvider)
+                .retriever(nestingRetriever)
+                .listener(listener)
+                .build();
+
+        CompletionResponse response = outerEngine.chat(ChatRequest.builder()
+                .requestId("req-outer").providerId("outer").model("m-outer").userInput("hello").build());
+
+        assertThat(response.content()).isEqualTo("outer response");
+
+        List<SpanData> spans = spanExporter.getFinishedSpanItems();
+        assertThat(spans).hasSize(2);
+
+        SpanData outerSpan = spans.stream()
+                .filter(s -> "req-outer".equals(s.getAttributes().get(OtelEngineListener.ATTR_REQUEST_ID)))
+                .findFirst().orElseThrow();
+        SpanData innerSpan = spans.stream()
+                .filter(s -> "req-inner".equals(s.getAttributes().get(OtelEngineListener.ATTR_REQUEST_ID)))
+                .findFirst().orElseThrow();
+
+        // The outer span isn't corrupted by the nested call: attributes/events set
+        // by callbacks that fire AFTER the nested chat() returns (route resolution,
+        // provider call, output guard, chat complete) all landed on the right span.
+        assertThat(outerSpan.getAttributes().get(OtelEngineListener.ATTR_PROVIDER_ID)).isEqualTo("outer");
+        assertThat(outerSpan.getAttributes().get(OtelEngineListener.ATTR_MODEL)).isEqualTo("m-outer");
+        assertThat(outerSpan.getStatus().getStatusCode()).isEqualTo(StatusCode.OK);
+        List<String> outerEvents = outerSpan.getEvents().stream().map(event -> event.getName()).toList();
+        assertThat(outerEvents).containsExactly(
+                "input_guard.complete", "retrieval.complete", "route.resolved",
+                "provider_call.complete", "output_guard.complete"
+        );
+
+        assertThat(innerSpan.getAttributes().get(OtelEngineListener.ATTR_PROVIDER_ID)).isEqualTo("inner");
+        assertThat(innerSpan.getStatus().getStatusCode()).isEqualTo(StatusCode.OK);
+
+        // Bonus: OpenTelemetry's own Context correctly parents the nested span
+        // under the outer one, since the outer span was current while it ran.
+        assertThat(innerSpan.getParentSpanId()).isEqualTo(outerSpan.getSpanId());
     }
 
     @Test

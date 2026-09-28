@@ -45,7 +45,11 @@ public interface EngineListener {
     default void onRouteResolved(String requestId, String providerId, String model) {
     }
 
-    /** Fired after the provider call returns, with how long it took. */
+    /**
+     * Fired after the provider call returns, with how long it took. Not
+     * fired by {@code chatStream}, which calls {@code Provider.stream}
+     * rather than {@code Provider.complete}.
+     */
     default void onProviderCallComplete(String requestId, CompletionResponse response, Duration duration) {
     }
 

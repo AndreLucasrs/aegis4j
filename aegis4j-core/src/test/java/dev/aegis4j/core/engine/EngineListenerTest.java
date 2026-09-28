@@ -182,6 +182,46 @@ class EngineListenerTest {
     }
 
     @Test
+    void listenerErrorsAreIsolatedTooNotJustRuntimeExceptions() {
+        // A listener throwing an Error (not just a RuntimeException) - e.g. a
+        // StackOverflowError from a buggy recursive attribute mapper - must not
+        // break the pipeline either, and in particular must not prevent
+        // onChatStarted's later pairing with onChatComplete/onChatFailed.
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        RecordingListener recordingListener = new RecordingListener();
+        EngineListener throwingListener = new EngineListener() {
+            @Override
+            public void onChatStarted(String requestId) {
+                throw new StackOverflowError("boom on start");
+            }
+
+            @Override
+            public void onChatComplete(String requestId, Duration totalDuration) {
+                throw new NoClassDefFoundError("boom on complete");
+            }
+        };
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .listener(throwingListener)
+                .listener(recordingListener)
+                .build();
+
+        CompletionResponse response = engine.chat(ChatRequest.builder()
+                .requestId("req-error-iso").providerId("fake").model("m").userInput("hi").build());
+
+        assertThat(response.content()).isEqualTo("ok");
+        assertThat(recordingListener.events).containsExactly(
+                "onChatStarted:req-error-iso",
+                "onInputGuardComplete:hi",
+                "onRouteResolved:fake/m",
+                "onProviderCallComplete:ok",
+                "onOutputGuardComplete:ok",
+                "onChatComplete"
+        );
+    }
+
+    @Test
     void chatStreamNotifiesSetupPhasesAndClosesOutWithOnChatCompleteButNoOutputGuard() {
         FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
         RecordingListener listener = new RecordingListener();

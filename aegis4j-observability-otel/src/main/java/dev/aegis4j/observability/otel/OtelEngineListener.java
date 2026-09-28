@@ -11,6 +11,8 @@ import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 
 import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -22,17 +24,31 @@ import java.util.function.Consumer;
  * OK or ERROR {@link StatusCode}) when {@code onChatComplete}/
  * {@code onChatFailed} fires.
  *
- * <p>Correlates a request's callbacks via a {@link ThreadLocal} rather than
- * {@code requestId}: {@link EngineListener}'s contract guarantees the
- * engine runs one request's whole pipeline synchronously on a single
- * thread, so {@code onChatStarted} through {@code onChatComplete}/
- * {@code onChatFailed} always happen on that same thread, in order, before
- * the next request reuses it. This means a single {@code OtelEngineListener}
- * instance safely serves concurrent requests on different threads.
+ * <p>Correlates a request's callbacks via OpenTelemetry's own {@code
+ * Context} — {@link Span#current()}, backed by {@link Span#makeCurrent()} —
+ * rather than remembering the span itself. That matters under reentrancy:
+ * nothing in the {@code Guard}/{@code Provider}/{@code Retriever}/
+ * {@code ModelRouter} contracts rules out a nested {@code chat()}/
+ * {@code chatStream()} call on the same thread (e.g. a custom component
+ * that itself drives another engine call from inside one of those phases).
+ * A single {@code ThreadLocal<Span>} would break under that: the inner
+ * call's {@code onChatStarted} would overwrite it, and the inner call's
+ * {@code onChatComplete}/{@code onChatFailed} would clear it — leaving the
+ * outer call's later callbacks with no span to attach to. {@code Context}'s
+ * make-current/close pairs are a proper LIFO stack instead, so the inner
+ * span is current for its own callbacks (and is even correctly parented
+ * under the outer span) and the outer span is automatically current again
+ * once the inner call's scope closes.
  *
- * <p>Never throws: every method either finds the current thread's span (set
- * by {@code onChatStarted}) or silently no-ops, so a bug here can never
- * propagate into the pipeline — though {@code Aegis4jEngine} isolates
+ * <p>A small per-thread {@link Deque} of {@link Scope} is still kept —
+ * not for correlation, only because the OpenTelemetry API requires holding
+ * on to the exact {@code Scope} instance returned by {@code makeCurrent()}
+ * in order to close it, and closing must happen in the same LIFO order the
+ * scopes were opened for the {@code Context} stack to unwind correctly.
+ *
+ * <p>Never throws: every method either finds a currently active span (made
+ * current by {@code onChatStarted}) or silently no-ops, so a bug here can
+ * never propagate into the pipeline — though {@code Aegis4jEngine} isolates
  * listener exceptions regardless.
  */
 public final class OtelEngineListener implements EngineListener {
@@ -51,7 +67,7 @@ public final class OtelEngineListener implements EngineListener {
     static final AttributeKey<Long> ATTR_COMPLETION_TOKENS = AttributeKey.longKey("aegis4j.usage.completion_tokens");
 
     private final Tracer tracer;
-    private final ThreadLocal<RequestSpan> current = new ThreadLocal<>();
+    private final ThreadLocal<Deque<Scope>> scopeStack = ThreadLocal.withInitial(ArrayDeque::new);
 
     public OtelEngineListener(OpenTelemetry openTelemetry) {
         Objects.requireNonNull(openTelemetry, "openTelemetry");
@@ -63,7 +79,7 @@ public final class OtelEngineListener implements EngineListener {
         Span span = tracer.spanBuilder(SPAN_NAME)
                 .setAttribute(ATTR_REQUEST_ID, requestId)
                 .startSpan();
-        current.set(new RequestSpan(span, span.makeCurrent()));
+        scopeStack.get().push(span.makeCurrent());
     }
 
     @Override
@@ -119,27 +135,31 @@ public final class OtelEngineListener implements EngineListener {
         });
     }
 
+    /**
+     * {@link Span#current()} returns the invalid (no-op) span — never
+     * {@code null} — when nothing is current, which is how this silently
+     * no-ops instead of needing its own "is a span active" bookkeeping.
+     */
     private void withSpan(Consumer<Span> action) {
-        RequestSpan requestSpan = current.get();
-        if (requestSpan != null) {
-            action.accept(requestSpan.span());
+        Span span = Span.current();
+        if (span.getSpanContext().isValid()) {
+            action.accept(span);
         }
     }
 
     private void end(Consumer<Span> beforeEnd) {
-        RequestSpan requestSpan = current.get();
-        if (requestSpan == null) {
+        Span span = Span.current();
+        if (!span.getSpanContext().isValid()) {
             return;
         }
         try {
-            beforeEnd.accept(requestSpan.span());
-            requestSpan.span().end();
+            beforeEnd.accept(span);
+            span.end();
         } finally {
-            requestSpan.scope().close();
-            current.remove();
+            Deque<Scope> stack = scopeStack.get();
+            if (!stack.isEmpty()) {
+                stack.pop().close();
+            }
         }
-    }
-
-    private record RequestSpan(Span span, Scope scope) {
     }
 }
