@@ -20,6 +20,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.URI;
@@ -48,13 +50,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class Aegis4jServerE2ETest {
 
+    @TempDir
+    private Path tempDir;
+
     private WireMockServer wireMock;
     private Javalin app;
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final ObjectMapper mapper = new ObjectMapper();
 
     @BeforeEach
-    void setUp(@TempDir Path tempDir) throws IOException {
+    void setUp() throws IOException {
         wireMock = new WireMockServer(options().dynamicPort());
         wireMock.start();
         wireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
@@ -73,6 +78,16 @@ class Aegis4jServerE2ETest {
                 FULL_WEATHER_SKILL_BODY
                 """);
 
+        app = Aegis4jServerApp.createApp(buildFullPipelineEngine(), OllamaProvider.ID, null);
+        app.start(0);
+    }
+
+    /**
+     * Builds the same engine/guard/skill pipeline as {@link #setUp()} (input guard,
+     * PII redaction, skill catalog) so the auth tests exercise the full production
+     * wiring rather than a stripped-down one, and only vary the server's api key.
+     */
+    private Aegis4jEngine buildFullPipelineEngine() {
         OllamaProvider ollama = new OllamaProvider(
                 "http://localhost:" + wireMock.port(), HttpClient.newHttpClient(), Duration.ofSeconds(5)
         );
@@ -82,14 +97,11 @@ class Aegis4jServerE2ETest {
         SkillRegistry skillRegistry = SkillRegistry.inMemory();
         new MarkdownSkillLoader().loadDirectory(tempDir).forEach(skillRegistry::register);
 
-        Aegis4jEngine engine = Aegis4jEngine.builder()
+        return Aegis4jEngine.builder()
                 .providerRegistry(providerRegistry)
                 .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000), RegexPiiGuard.allPatterns()))
                 .skillRegistry(skillRegistry)
                 .build();
-
-        app = Aegis4jServerApp.createApp(engine, OllamaProvider.ID);
-        app.start(0);
     }
 
     @AfterEach
@@ -145,7 +157,7 @@ class Aegis4jServerE2ETest {
                 .modelRouter(router)
                 .build();
 
-        Javalin routedApp = Aegis4jServerApp.createApp(routedEngine, OllamaProvider.ID);
+        Javalin routedApp = Aegis4jServerApp.createApp(routedEngine, OllamaProvider.ID, null);
         routedApp.start(0);
         try {
             HttpRequest request = HttpRequest.newBuilder(
@@ -183,7 +195,7 @@ class Aegis4jServerE2ETest {
                 .maxToolIterations(2)
                 .build();
 
-        Javalin toolApp = Aegis4jServerApp.createApp(toolEngine, "openai-test");
+        Javalin toolApp = Aegis4jServerApp.createApp(toolEngine, "openai-test", null);
         toolApp.start(0);
         try {
             HttpRequest request = HttpRequest.newBuilder(
@@ -203,11 +215,129 @@ class Aegis4jServerE2ETest {
         }
     }
 
+    @Test
+    void acceptsRequestWithMatchingBearerTokenWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpResponse<String> response = postChatCompletion(authApp, "Bearer secret-key", """
+                    {"model":"llama3","messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(200);
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    @Test
+    void rejectsRequestWithMissingBearerTokenWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpResponse<String> response = postChatCompletion(authApp, null, """
+                    {"messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(401);
+            JsonNode body = mapper.readTree(response.body());
+            assertThat(body.at("/error/code").asText()).isEqualTo("unauthorized");
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    @Test
+    void acceptsRequestWithLowercaseBearerSchemeWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpResponse<String> response = postChatCompletion(authApp, "bearer secret-key", """
+                    {"model":"llama3","messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(200);
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    @Test
+    void rejectsRequestWithTokenMissingBearerPrefixWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            // Raw token with no "Bearer " scheme at all must still be rejected — guards
+            // against a future regression in bearerToken() silently accepting it.
+            HttpResponse<String> response = postChatCompletion(authApp, "secret-key", """
+                    {"model":"llama3","messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(401);
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " "})
+    void keepsServerOpenWhenApiKeyIsBlank(String blankApiKey) throws Exception {
+        Javalin openApp = startAppWithApiKey(blankApiKey);
+        try {
+            HttpResponse<String> response = postChatCompletion(openApp, null, """
+                    {"model":"llama3","messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(200);
+        } finally {
+            openApp.stop();
+        }
+    }
+
+    @Test
+    void rejectsRequestWithWrongBearerTokenWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpResponse<String> response = postChatCompletion(authApp, "Bearer wrong-key", """
+                    {"messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(401);
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    @Test
+    void healthEndpointStaysOpenWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + authApp.port() + "/health"))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.body()).isEqualTo("ok");
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    private Javalin startAppWithApiKey(String apiKey) {
+        Javalin authApp = Aegis4jServerApp.createApp(buildFullPipelineEngine(), OllamaProvider.ID, apiKey);
+        authApp.start(0);
+        return authApp;
+    }
+
     private HttpResponse<String> postChatCompletion(String jsonBody) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + app.port() + "/v1/chat/completions"))
+        return postChatCompletion(app, null, jsonBody);
+    }
+
+    private HttpResponse<String> postChatCompletion(Javalin targetApp, String authorizationHeader, String jsonBody)
+            throws IOException, InterruptedException {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://localhost:" + targetApp.port() + "/v1/chat/completions"))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
-                .build();
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody));
+        if (authorizationHeader != null) {
+            builder.header("Authorization", authorizationHeader);
+        }
+        return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
     }
 }

@@ -40,7 +40,9 @@ public final class ChatCompletionsHandler implements Handler {
 
         if (requestDto.messages() == null || requestDto.messages().isEmpty()) {
             ctx.status(400).contentType("application/json");
-            ctx.result(mapper.writeValueAsString(Map.of("error", "messages must not be empty")));
+            ctx.result(mapper.writeValueAsString(Map.of(
+                    "error", Map.of("code", "invalid_request", "message", "messages must not be empty")
+            )));
             return;
         }
 

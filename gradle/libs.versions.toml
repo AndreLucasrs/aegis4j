@@ -4,11 +4,13 @@ assertj = "3.26.3"
 mockito = "5.14.2"
 wiremock = "3.9.2"
 jackson = "2.18.1"
+jsonSchemaValidator = "1.5.5"
 javalin = "6.3.0"
 slf4j = "2.0.16"
 postgresql = "42.7.4"
 pgvector = "0.1.6"
 testcontainers = "1.20.3"
+opentelemetry = "1.45.0"
 
 [libraries]
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
@@ -18,6 +20,7 @@ mockito-core = { module = "org.mockito:mockito-core", version.ref = "mockito" }
 wiremock = { module = "org.wiremock:wiremock", version.ref = "wiremock" }
 jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
 jackson-yaml = { module = "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml", version.ref = "jackson" }
+json-schema-validator = { module = "com.networknt:json-schema-validator", version.ref = "jsonSchemaValidator" }
 javalin = { module = "io.javalin:javalin", version.ref = "javalin" }
 slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
 postgresql-driver = { module = "org.postgresql:postgresql", version.ref = "postgresql" }
@@ -25,3 +28,5 @@ pgvector-jdbc = { module = "com.pgvector:pgvector", version.ref = "pgvector" }
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
 testcontainers-postgresql = { module = "org.testcontainers:postgresql", version.ref = "testcontainers" }
 testcontainers-junit-jupiter = { module = "org.testcontainers:junit-jupiter", version.ref = "testcontainers" }
+opentelemetry-api = { module = "io.opentelemetry:opentelemetry-api", version.ref = "opentelemetry" }
+opentelemetry-sdk-testing = { module = "io.opentelemetry:opentelemetry-sdk-testing", version.ref = "opentelemetry" }

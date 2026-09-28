@@ -9,11 +9,14 @@ import dev.aegis4j.api.provider.Provider;
 import dev.aegis4j.api.provider.ToolCall;
 import dev.aegis4j.api.provider.ToolDefinition;
 import dev.aegis4j.api.provider.ToolExecutor;
+import dev.aegis4j.api.provider.Usage;
 import dev.aegis4j.api.rag.RetrievedChunk;
 import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.api.routing.RoutingContext;
+import dev.aegis4j.api.usage.UsageTracker;
 import dev.aegis4j.core.guard.GuardChain;
+import dev.aegis4j.core.observability.EngineListener;
 import dev.aegis4j.core.persona.PersonaManager;
 import dev.aegis4j.core.prompt.PromptAssembler;
 import dev.aegis4j.core.provider.ProviderRegistry;
@@ -22,9 +25,12 @@ import dev.aegis4j.core.skill.KeywordSkillActivationStrategy;
 import dev.aegis4j.core.skill.SkillActivationStrategy;
 import dev.aegis4j.core.skill.SkillRegistry;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 /**
@@ -35,6 +41,7 @@ import java.util.stream.Stream;
  */
 public final class Aegis4jEngine {
 
+    private static final System.Logger LOGGER = System.getLogger(Aegis4jEngine.class.getName());
     private static final int DEFAULT_TOP_K = 4;
     static final int DEFAULT_MAX_TOOL_ITERATIONS = 5;
 
@@ -46,6 +53,8 @@ public final class Aegis4jEngine {
     private final PersonaManager personaManager;
     private final Retriever retriever;
     private final ModelRouter modelRouter;
+    private final UsageTracker usageTracker;
+    private final List<EngineListener> listeners;
     private final List<ToolDefinition> toolDefinitions;
     private final ToolExecutor toolExecutor;
     private final int maxToolIterations;
@@ -62,6 +71,8 @@ public final class Aegis4jEngine {
         this.personaManager = builder.personaManager;
         this.retriever = builder.retriever;
         this.modelRouter = builder.modelRouter;
+        this.usageTracker = builder.usageTracker;
+        this.listeners = List.copyOf(builder.listeners);
         this.toolDefinitions = builder.toolDefinitions;
         this.toolExecutor = builder.toolExecutor;
         this.maxToolIterations = builder.maxToolIterations;
@@ -72,50 +83,62 @@ public final class Aegis4jEngine {
     }
 
     public CompletionResponse chat(ChatRequest request) {
-        GuardContext ctx = new GuardContext(request.requestId(), request.userId(), Map.of());
+        String requestId = request.requestId();
+        Instant chatStart = Instant.now();
+        try {
+            notifyListeners(l -> l.onChatStarted(requestId));
 
-        String sanitizedInput = guardChain.runInput(ctx, request.userInput());
-        List<RetrievedChunk> retrievedChunks = resolveChunks(sanitizedInput, request);
-        ResolvedRoute route = resolveRoute(sanitizedInput, request);
+            Pipeline pipeline = runPipeline(requestId, request);
 
-        List<Message> messages = promptAssembler.assemble(
-                personaManager.active(),
-                skillRegistry,
-                activationStrategy,
-                includeSkillCatalogInSystemPrompt,
-                retrievedChunks,
-                request.history(),
-                sanitizedInput
-        );
+            Provider provider = providerRegistry.resolve(pipeline.route().providerId());
+            CompletionResponse response = callProvider(provider, pipeline.route(), requestId, pipeline.completionRequest());
 
-        Provider provider = providerRegistry.resolve(route.providerId());
-        CompletionRequest completionRequest = CompletionRequest.builder()
-                .model(route.model())
-                .messages(messages)
-                .temperature(request.temperature())
-                .maxTokens(request.maxTokens())
-                .tools(toolDefinitions)
-                .build();
+            if (toolExecutor != null) {
+                response = runToolLoop(
+                        provider, pipeline.route(), requestId, request, pipeline.completionRequest().messages(), response);
+            }
 
-        CompletionResponse response = provider.complete(completionRequest);
+            // response.content() can legitimately be null after a tool-call-only
+            // turn (see the OpenAI wire format): guards operate on text, not on
+            // the absence of it, so an empty string goes through instead of null.
+            String sanitizedOutput = guardChain.runOutput(
+                    pipeline.guardContext(), response.content() == null ? "" : response.content());
+            notifyListeners(l -> l.onOutputGuardComplete(requestId, sanitizedOutput));
 
-        if (toolExecutor != null) {
-            response = runToolLoop(provider, route, request, messages, response);
+            CompletionResponse result = new CompletionResponse(
+                    response.id(),
+                    response.model(),
+                    sanitizedOutput,
+                    response.finishReason(),
+                    response.usage(),
+                    response.toolCalls()
+            );
+            notifyListeners(l -> l.onChatComplete(requestId, Duration.between(chatStart, Instant.now())));
+            return result;
+        } catch (RuntimeException e) {
+            Duration failedDuration = Duration.between(chatStart, Instant.now());
+            notifyListeners(l -> l.onChatFailed(requestId, e, failedDuration));
+            throw e;
         }
+    }
 
-        // response.content() can legitimately be null after a tool-call-only
-        // turn (see the OpenAI wire format): guards operate on text, not on
-        // the absence of it, so an empty string goes through instead of null.
-        String sanitizedOutput = guardChain.runOutput(ctx, response.content() == null ? "" : response.content());
-
-        return new CompletionResponse(
-                response.id(),
-                response.model(),
-                sanitizedOutput,
-                response.finishReason(),
-                response.usage(),
-                response.toolCalls()
-        );
+    /**
+     * Wraps a single {@code provider.complete()} call with the
+     * timing/listener/usage-tracking instrumentation {@link #chat} needs.
+     * Shared by the initial call and every follow-up call
+     * {@link #runToolLoop} makes, so a multi-round tool-calling exchange
+     * gets {@code onProviderCallComplete} and {@link #recordUsage} for every
+     * round it actually spends provider tokens on, not just the first.
+     */
+    private CompletionResponse callProvider(
+            Provider provider, ResolvedRoute route, String requestId, CompletionRequest completionRequest
+    ) {
+        Instant providerCallStart = Instant.now();
+        CompletionResponse response = provider.complete(completionRequest);
+        Duration providerCallDuration = Duration.between(providerCallStart, Instant.now());
+        notifyListeners(l -> l.onProviderCallComplete(requestId, response, providerCallDuration));
+        recordUsage(route, response);
+        return response;
     }
 
     /**
@@ -133,7 +156,8 @@ public final class Aegis4jEngine {
      * most 5 calls to the provider altogether, not 6.
      */
     private CompletionResponse runToolLoop(
-            Provider provider, ResolvedRoute route, ChatRequest request, List<Message> messages, CompletionResponse response
+            Provider provider, ResolvedRoute route, String requestId, ChatRequest request,
+            List<Message> messages, CompletionResponse response
     ) {
         List<Message> conversation = new ArrayList<>(messages);
         int providerCalls = 1;
@@ -155,7 +179,7 @@ public final class Aegis4jEngine {
                     .maxTokens(request.maxTokens())
                     .tools(toolDefinitions)
                     .build();
-            response = provider.complete(followUp);
+            response = callProvider(provider, route, requestId, followUp);
             providerCalls++;
         }
 
@@ -191,13 +215,63 @@ public final class Aegis4jEngine {
      * and never inspects the stream for tool calls — that loop only exists
      * in {@link #chat}. Callers that configure tools and use this method
      * instead will see the feature silently do nothing.
+     *
+     * <p>For the same reason, {@link EngineListener} never sees
+     * {@code onOutputGuardComplete} or {@code onProviderCallComplete} here —
+     * output guards don't run in this method, and the provider call itself
+     * is {@link Provider#stream}, not {@link Provider#complete}. {@code
+     * onChatComplete}/{@code onChatFailed} still fire (so every {@code
+     * onChatStarted} is reliably paired with exactly one of the two, letting
+     * a listener close out per-request state such as a span), but their
+     * duration only covers this synchronous setup — resolving the request
+     * into a {@link CompletionRequest} and obtaining the {@link Stream} from
+     * the provider — not the caller's later consumption of that stream.
+     *
+     * <p>v1 limitation: {@link dev.aegis4j.api.provider.CompletionChunk}
+     * carries no {@code Usage}, so a configured {@link UsageTracker} is
+     * never called from this method — only {@link #chat} records usage.
+     * Providers would need to surface usage on the terminal chunk before
+     * this method could track streamed calls.
      */
     public Stream<dev.aegis4j.api.provider.CompletionChunk> chatStream(ChatRequest request) {
-        GuardContext ctx = new GuardContext(request.requestId(), request.userId(), Map.of());
+        String requestId = request.requestId();
+        Instant chatStart = Instant.now();
+        try {
+            notifyListeners(l -> l.onChatStarted(requestId));
 
-        String sanitizedInput = guardChain.runInput(ctx, request.userInput());
+            Pipeline pipeline = runPipeline(requestId, request);
+
+            Provider provider = providerRegistry.resolve(pipeline.route().providerId());
+            Stream<dev.aegis4j.api.provider.CompletionChunk> stream = provider.stream(pipeline.completionRequest());
+            notifyListeners(l -> l.onChatComplete(requestId, Duration.between(chatStart, Instant.now())));
+            return stream;
+        } catch (RuntimeException e) {
+            Duration failedDuration = Duration.between(chatStart, Instant.now());
+            notifyListeners(l -> l.onChatFailed(requestId, e, failedDuration));
+            throw e;
+        }
+    }
+
+    /**
+     * The pipeline segment shared by {@link #chat} and {@link #chatStream}:
+     * input guard → retrieval (if configured) → route resolution → prompt
+     * assembly → {@link CompletionRequest} assembly, firing the matching
+     * {@link EngineListener} callback after each phase. Kept as a single
+     * method specifically so the two callers can't drift apart on which
+     * callbacks they fire for this shared portion of the pipeline.
+     */
+    private Pipeline runPipeline(String requestId, ChatRequest request) {
+        GuardContext inputCtx = new GuardContext(request.requestId(), request.userId(), Map.of());
+
+        String sanitizedInput = guardChain.runInput(inputCtx, request.userInput());
+        notifyListeners(l -> l.onInputGuardComplete(requestId, sanitizedInput));
+
         List<RetrievedChunk> retrievedChunks = resolveChunks(sanitizedInput, request);
+        if (retriever != null) {
+            notifyListeners(l -> l.onRetrievalComplete(requestId, retrievedChunks));
+        }
         ResolvedRoute route = resolveRoute(sanitizedInput, request);
+        notifyListeners(l -> l.onRouteResolved(requestId, route.providerId(), route.model()));
 
         List<Message> messages = promptAssembler.assemble(
                 personaManager.active(),
@@ -209,15 +283,26 @@ public final class Aegis4jEngine {
                 sanitizedInput
         );
 
-        Provider provider = providerRegistry.resolve(route.providerId());
         CompletionRequest completionRequest = CompletionRequest.builder()
                 .model(route.model())
                 .messages(messages)
                 .temperature(request.temperature())
                 .maxTokens(request.maxTokens())
+                .tools(toolDefinitions)
                 .build();
 
-        return provider.stream(completionRequest);
+        // Output guards (e.g. a grounding/hallucination judge) need the RAG
+        // context, which is only known after the input-guard ctx above was
+        // built — hence a separate GuardContext here rather than reusing
+        // inputCtx. chatStream() never reads Pipeline.guardContext() since it
+        // doesn't run output guards, so this costs nothing on that path.
+        GuardContext outputCtx = new GuardContext(request.requestId(), request.userId(),
+                Map.of(GuardContext.RETRIEVED_CHUNKS_KEY, retrievedChunks));
+
+        return new Pipeline(outputCtx, route, completionRequest);
+    }
+
+    private record Pipeline(GuardContext guardContext, ResolvedRoute route, CompletionRequest completionRequest) {
     }
 
     /**
@@ -259,6 +344,59 @@ public final class Aegis4jEngine {
     private record ResolvedRoute(String providerId, String model) {
     }
 
+    /**
+     * Isolates listener failures from the pipeline: a listener must never be
+     * able to break (or alter) the real response, so whatever it throws —
+     * including an {@link Error} such as {@link StackOverflowError}, not
+     * just a {@link RuntimeException} — is caught and logged, never
+     * propagated. This makes every {@code notifyListeners} call (including
+     * the {@code onChatStarted} one) inherently safe to call from inside
+     * {@link #chat}/{@link #chatStream}'s {@code try} block: it can never be
+     * the reason an {@code onChatStarted} goes unpaired with an
+     * {@code onChatComplete}/{@code onChatFailed}.
+     */
+    private void notifyListeners(Consumer<EngineListener> callback) {
+        for (EngineListener listener : listeners) {
+            try {
+                callback.accept(listener);
+            } catch (RuntimeException | Error e) {
+                LOGGER.log(System.Logger.Level.WARNING, "EngineListener threw an exception; ignoring", e);
+            }
+        }
+    }
+
+    /**
+     * Reports usage to a configured {@link UsageTracker}, if any — a no-op
+     * when none is set. Isolated the same way {@link #notifyListeners} is:
+     * a tracker is typically a side effect (writing to a DB, a billing API,
+     * a metrics system) and must never be able to turn an already-successful
+     * LLM response into a failed {@code chat()} call, so whatever it throws
+     * is caught and logged, never propagated.
+     *
+     * <p>Keys by {@code route.model()} — the model {@code chat()} actually
+     * resolved and requested (explicit on {@link ChatRequest}, or via
+     * {@link ModelRouter}) — rather than {@code response.model()}, since a
+     * provider may echo back a more specific string (e.g. a dated snapshot
+     * alias) than what was asked for; see {@code InMemoryUsageTracker}'s
+     * class Javadoc for why this matters for pricing lookups.
+     *
+     * <p>Falls back to {@link Usage#UNKNOWN} when {@code response.usage()}
+     * is {@code null} — neither {@link Provider} nor {@link CompletionResponse}
+     * guarantee a non-null {@code usage()}, even though every provider
+     * shipped in this repo today always sets one.
+     */
+    private void recordUsage(ResolvedRoute route, CompletionResponse response) {
+        if (usageTracker == null) {
+            return;
+        }
+        Usage usage = response.usage() != null ? response.usage() : Usage.UNKNOWN;
+        try {
+            usageTracker.record(route.providerId(), route.model(), usage);
+        } catch (RuntimeException | Error e) {
+            LOGGER.log(System.Logger.Level.WARNING, "UsageTracker threw an exception; ignoring", e);
+        }
+    }
+
     public static final class Builder {
         private ProviderRegistry providerRegistry = new ProviderRegistry();
         private GuardChain guardChain = GuardChain.of();
@@ -267,10 +405,12 @@ public final class Aegis4jEngine {
         private PersonaManager personaManager = PersonaManager.none();
         private Retriever retriever;
         private ModelRouter modelRouter;
+        private UsageTracker usageTracker;
         private Boolean skillCatalogInSystemPrompt;
         private List<ToolDefinition> toolDefinitions = List.of();
         private ToolExecutor toolExecutor;
         private int maxToolIterations = DEFAULT_MAX_TOOL_ITERATIONS;
+        private final List<EngineListener> listeners = new ArrayList<>();
 
         public Builder providerRegistry(ProviderRegistry providerRegistry) {
             this.providerRegistry = providerRegistry;
@@ -336,6 +476,19 @@ public final class Aegis4jEngine {
         }
 
         /**
+         * Opts into usage tracking: once set, {@link #chat} reports every
+         * successful completion's {@link dev.aegis4j.api.provider.Usage} to
+         * this tracker. {@code null} is a safe no-op — leaves usage tracking
+         * disabled (or whatever was set before).
+         */
+        public Builder usageTracker(UsageTracker usageTracker) {
+            if (usageTracker != null) {
+                this.usageTracker = usageTracker;
+            }
+            return this;
+        }
+
+        /**
          * Opts into the tool-calling loop: off by default (a fresh
          * {@code Builder} sends no {@code tools} to the provider and never
          * inspects {@code response.toolCalls()}) so existing consumers such
@@ -392,6 +545,22 @@ public final class Aegis4jEngine {
                 throw new IllegalArgumentException("maxToolIterations must be at least 1, got " + maxToolIterations);
             }
             this.maxToolIterations = maxToolIterations;
+            return this;
+        }
+
+        /**
+         * Registers an opt-in {@link EngineListener} for pipeline
+         * instrumentation (tracing, metrics, ...). Accumulates: may be
+         * called more than once to register several listeners.
+         */
+        public Builder listener(EngineListener listener) {
+            this.listeners.add(listener);
+            return this;
+        }
+
+        /** Registers several {@link EngineListener}s at once; see {@link #listener(EngineListener)}. */
+        public Builder listeners(List<EngineListener> listeners) {
+            this.listeners.addAll(listeners);
             return this;
         }
 
