@@ -19,6 +19,7 @@ import dev.aegis4j.provider.openai.OpenAiCompatibleProvider;
 import dev.aegis4j.rag.mcp.McpToolArgumentMapper;
 import dev.aegis4j.rag.mcp.McpToolRetriever;
 import dev.aegis4j.routing.yaml.YamlRoutingRuleLoader;
+import dev.aegis4j.server.http.BearerAuthHandler;
 import dev.aegis4j.server.http.ChatCompletionsHandler;
 import dev.aegis4j.skills.markdown.MarkdownSkillLoader;
 import io.javalin.Javalin;
@@ -44,6 +45,7 @@ public final class Aegis4jServerApp {
         String providerId = System.getenv().getOrDefault("AEGIS4J_PROVIDER_ID", OllamaProvider.ID);
         int maxInputChars = Integer.parseInt(System.getenv().getOrDefault("AEGIS4J_MAX_INPUT_CHARS", "4000"));
         String skillsDir = System.getenv("AEGIS4J_SKILLS_DIR");
+        String serverApiKey = System.getenv("AEGIS4J_SERVER_API_KEY");
 
         ProviderRegistry providerRegistry = new ProviderRegistry();
         providerRegistry.discover(Thread.currentThread().getContextClassLoader());
@@ -62,7 +64,7 @@ public final class Aegis4jServerApp {
                 .modelRouter(buildModelRouter())
                 .build();
 
-        createApp(engine, providerId).start(port);
+        createApp(engine, providerId, serverApiKey).start(port);
     }
 
     /**
@@ -141,11 +143,18 @@ public final class Aegis4jServerApp {
         return value;
     }
 
-    public static Javalin createApp(Aegis4jEngine engine, String providerId) {
+    /**
+     * @param serverApiKey expected bearer token for non-health endpoints, or {@code null}/blank
+     *                      to keep the server open (default, backward-compatible behavior).
+     */
+    public static Javalin createApp(Aegis4jEngine engine, String providerId, String serverApiKey) {
         ObjectMapper mapper = new ObjectMapper().setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
 
         Javalin app = Javalin.create(config -> config.http.customCompression(sseSafeCompressionStrategy()));
         app.get("/health", ctx -> ctx.result("ok"));
+        if (serverApiKey != null && !serverApiKey.isBlank()) {
+            app.before(new BearerAuthHandler(serverApiKey, mapper));
+        }
         app.post("/v1/chat/completions", new ChatCompletionsHandler(engine, providerId, mapper));
         return app;
     }

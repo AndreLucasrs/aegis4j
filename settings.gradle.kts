@@ -25,4 +25,5 @@ include(
     "aegis4j-rag-jdbc-pgvector",
     "aegis4j-rag-mcp",
     "aegis4j-routing",
+    "aegis4j-observability-otel",
 )
