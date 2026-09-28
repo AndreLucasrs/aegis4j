@@ -458,7 +458,7 @@ class Aegis4jEngineTest {
                 .usageTracker(tracker)
                 .build();
 
-        engine.chatStream(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build()).toList();
+        engine.chatStream(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build()).chunks().toList();
 
         assertThat(recorded).isEmpty();
     }

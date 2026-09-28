@@ -23,11 +23,14 @@ import dev.aegis4j.server.http.BearerAuthHandler;
 import dev.aegis4j.server.http.ChatCompletionsHandler;
 import dev.aegis4j.skills.markdown.MarkdownSkillLoader;
 import io.javalin.Javalin;
+import io.javalin.compression.CompressionStrategy;
+import io.javalin.compression.Gzip;
 
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -147,12 +150,28 @@ public final class Aegis4jServerApp {
     public static Javalin createApp(Aegis4jEngine engine, String providerId, String serverApiKey) {
         ObjectMapper mapper = new ObjectMapper().setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
 
-        Javalin app = Javalin.create();
+        Javalin app = Javalin.create(config -> config.http.customCompression(sseSafeCompressionStrategy()));
         app.get("/health", ctx -> ctx.result("ok"));
         if (serverApiKey != null && !serverApiKey.isBlank()) {
             app.before(new BearerAuthHandler(serverApiKey, mapper));
         }
         app.post("/v1/chat/completions", new ChatCompletionsHandler(engine, providerId, mapper));
         return app;
+    }
+
+    /**
+     * Javalin's default {@code CompressionStrategy.GZIP} doesn't exclude
+     * {@code text/event-stream}: a large enough first SSE write would get
+     * transparently gzip-encoded, which is valid HTTP but defeats the point
+     * of streaming (compression buffers output instead of flushing it chunk
+     * by chunk) and typical SSE clients don't expect it. Excluding it here
+     * keeps gzip for every other response this server sends.
+     */
+    private static CompressionStrategy sseSafeCompressionStrategy() {
+        CompressionStrategy strategy = new CompressionStrategy(null, new Gzip(6));
+        List<String> excludedMimeTypes = new ArrayList<>(strategy.getExcludedMimeTypes());
+        excludedMimeTypes.add("text/event-stream");
+        strategy.setExcludedMimeTypes(excludedMimeTypes);
+        return strategy;
     }
 }

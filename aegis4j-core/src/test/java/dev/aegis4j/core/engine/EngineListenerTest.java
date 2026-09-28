@@ -233,6 +233,7 @@ class EngineListenerTest {
 
         engine.chatStream(ChatRequest.builder()
                 .requestId("req-2").providerId("fake").model("m").userInput("hi").build())
+                .chunks()
                 .forEach(chunk -> { });
 
         assertThat(listener.events).containsExactly(

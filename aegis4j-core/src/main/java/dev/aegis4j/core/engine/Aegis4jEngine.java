@@ -232,8 +232,22 @@ public final class Aegis4jEngine {
      * never called from this method — only {@link #chat} records usage.
      * Providers would need to surface usage on the terminal chunk before
      * this method could track streamed calls.
+     *
+     * <p>Everything up to and including {@code provider.stream(...)} runs
+     * synchronously before this method returns — input guards, retrieval,
+     * routing, prompt assembly, and opening the provider's streaming
+     * connection (which for every real HTTP-backed {@link Provider} means
+     * sending the request and reading the response status before any chunk
+     * is available). So {@link dev.aegis4j.core.guard.GuardBlockedException},
+     * {@link IllegalStateException} (routing misconfigured), a provider
+     * lookup failure, or a {@link dev.aegis4j.api.provider.ProviderException}
+     * opening the connection are all thrown directly from this call (and,
+     * like any other failure here, still trigger {@code onChatFailed}
+     * below), not lazily from the returned {@link StreamedCompletion#chunks()}
+     * — a caller can therefore still turn them into an HTTP error status,
+     * exactly like {@link #chat}.
      */
-    public Stream<dev.aegis4j.api.provider.CompletionChunk> chatStream(ChatRequest request) {
+    public StreamedCompletion chatStream(ChatRequest request) {
         String requestId = request.requestId();
         Instant chatStart = Instant.now();
         try {
@@ -242,9 +256,9 @@ public final class Aegis4jEngine {
             Pipeline pipeline = runPipeline(requestId, request);
 
             Provider provider = providerRegistry.resolve(pipeline.route().providerId());
-            Stream<dev.aegis4j.api.provider.CompletionChunk> stream = provider.stream(pipeline.completionRequest());
+            Stream<dev.aegis4j.api.provider.CompletionChunk> chunks = provider.stream(pipeline.completionRequest());
             notifyListeners(l -> l.onChatComplete(requestId, Duration.between(chatStart, Instant.now())));
-            return stream;
+            return new StreamedCompletion(requestId, pipeline.route().providerId(), pipeline.route().model(), chunks);
         } catch (RuntimeException e) {
             Duration failedDuration = Duration.between(chatStart, Instant.now());
             notifyListeners(l -> l.onChatFailed(requestId, e, failedDuration));

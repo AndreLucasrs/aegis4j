@@ -34,6 +34,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -177,6 +178,73 @@ class Aegis4jServerE2ETest {
     }
 
     @Test
+    void streamsSseChunksAndTerminatesWithDoneWhenStreamTrue() throws Exception {
+        WireMockServer streamingWireMock = new WireMockServer(options().dynamicPort());
+        streamingWireMock.start();
+        streamingWireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"model":"llama3","message":{"role":"assistant","content":"hel"},"done":false}
+                        {"model":"llama3","message":{"role":"assistant","content":"lo"},"done":false}
+                        {"model":"llama3","message":{"role":"assistant","content":""},"done":true}
+                        """)));
+
+        OllamaProvider ollama = new OllamaProvider(
+                "http://localhost:" + streamingWireMock.port(), HttpClient.newHttpClient(), Duration.ofSeconds(5)
+        );
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(ollama);
+
+        Aegis4jEngine streamingEngine = Aegis4jEngine.builder()
+                .providerRegistry(providerRegistry)
+                .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000)))
+                .build();
+
+        Javalin streamingApp = Aegis4jServerApp.createApp(streamingEngine, OllamaProvider.ID, null);
+        streamingApp.start(0);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + streamingApp.port() + "/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""
+                            {"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}
+                            """))
+                    .build();
+            HttpResponse<Stream<String>> response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.headers().firstValue("content-type")).hasValueSatisfying(
+                    contentType -> assertThat(contentType).startsWith("text/event-stream"));
+
+            List<String> dataLines;
+            try (Stream<String> lines = response.body()) {
+                dataLines = lines.filter(line -> line.startsWith("data: ")).map(line -> line.substring("data: ".length())).toList();
+            }
+
+            assertThat(dataLines).hasSize(4);
+            assertThat(dataLines.get(3)).isEqualTo("[DONE]");
+
+            JsonNode first = mapper.readTree(dataLines.get(0));
+            assertThat(first.at("/object").asText()).isEqualTo("chat.completion.chunk");
+            assertThat(first.at("/choices/0/delta/role").asText()).isEqualTo("assistant");
+            assertThat(first.at("/choices/0/delta/content").asText()).isEqualTo("hel");
+            assertThat(first.at("/choices/0/finish_reason").isNull()).isTrue();
+
+            JsonNode second = mapper.readTree(dataLines.get(1));
+            assertThat(second.at("/choices/0/delta/role").isMissingNode()).isTrue();
+            assertThat(second.at("/choices/0/delta/content").asText()).isEqualTo("lo");
+
+            JsonNode last = mapper.readTree(dataLines.get(2));
+            assertThat(last.at("/choices/0/delta/content").isMissingNode()).isTrue();
+            assertThat(last.at("/choices/0/finish_reason").asText()).isEqualTo("stop");
+        } finally {
+            streamingApp.stop();
+            streamingWireMock.stop();
+        }
+    }
+
+    @Test
     void toolCallLimitExceededMapsToStructuredFiveHundredResponse() throws Exception {
         wireMock.stubFor(post(urlEqualTo("/chat/completions")).willReturn(aResponse()
                 .withStatus(200)
@@ -226,6 +294,100 @@ class Aegis4jServerE2ETest {
             assertThat(response.statusCode()).isEqualTo(200);
         } finally {
             authApp.stop();
+        }
+    }
+
+    @Test
+    void returnsUnifiedErrorShapeWhenMessagesEmpty() throws Exception {
+        HttpResponse<String> response = postChatCompletion("""
+                {"model":"llama3","messages":[]}
+                """);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        JsonNode body = mapper.readTree(response.body());
+        assertThat(body.at("/error/code").asText()).isEqualTo("invalid_request");
+        assertThat(body.at("/error/message").asText()).isEqualTo("messages must not be empty");
+    }
+
+    @Test
+    void streamingReturnsUnifiedJsonErrorWhenProviderUnresolvable() throws Exception {
+        ProviderRegistry emptyRegistry = new ProviderRegistry();
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .providerRegistry(emptyRegistry)
+                .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000)))
+                .build();
+
+        Javalin brokenApp = Aegis4jServerApp.createApp(engine, "missing-provider", null);
+        brokenApp.start(0);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + brokenApp.port() + "/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""
+                            {"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}
+                            """))
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            assertThat(response.statusCode()).isEqualTo(400);
+            JsonNode body = mapper.readTree(response.body());
+            assertThat(body.at("/error/code").asText()).isEqualTo("unknown_provider");
+            assertThat(body.at("/error/message").asText()).contains("missing-provider");
+        } finally {
+            brokenApp.stop();
+        }
+    }
+
+    @Test
+    void streamingEmitsSseErrorEventThenDoneWhenProviderFailsMidStream() throws Exception {
+        WireMockServer brokenWireMock = new WireMockServer(options().dynamicPort());
+        brokenWireMock.start();
+        brokenWireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"model":"llama3","message":{"role":"assistant","content":"hel"},"done":false}
+                        not-valid-json
+                        """)));
+
+        OllamaProvider ollama = new OllamaProvider(
+                "http://localhost:" + brokenWireMock.port(), HttpClient.newHttpClient(), Duration.ofSeconds(5)
+        );
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(ollama);
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .providerRegistry(providerRegistry)
+                .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000)))
+                .build();
+
+        Javalin brokenApp = Aegis4jServerApp.createApp(engine, OllamaProvider.ID, null);
+        brokenApp.start(0);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + brokenApp.port() + "/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""
+                            {"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}
+                            """))
+                    .build();
+            HttpResponse<Stream<String>> response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+
+            assertThat(response.statusCode()).isEqualTo(200);
+
+            List<String> dataLines;
+            try (Stream<String> lines = response.body()) {
+                dataLines = lines.filter(line -> line.startsWith("data: ")).map(line -> line.substring("data: ".length())).toList();
+            }
+
+            assertThat(dataLines).hasSizeGreaterThanOrEqualTo(2);
+            assertThat(dataLines.get(dataLines.size() - 1)).isEqualTo("[DONE]");
+
+            JsonNode errorEvent = mapper.readTree(dataLines.get(dataLines.size() - 2));
+            assertThat(errorEvent.at("/error/code").asText()).isEqualTo("provider_error");
+        } finally {
+            brokenApp.stop();
+            brokenWireMock.stop();
         }
     }
 

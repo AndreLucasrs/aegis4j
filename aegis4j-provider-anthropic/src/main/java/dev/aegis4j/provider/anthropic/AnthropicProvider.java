@@ -126,6 +126,13 @@ public final class AnthropicProvider implements Provider {
         );
     }
 
+    /**
+     * The actual stop reason arrives earlier, on a {@code message_delta}
+     * event's {@code delta.stop_reason} — not tracked here yet, so the
+     * terminal chunk built from {@code message_stop} carries no
+     * {@link FinishReason} (see {@link CompletionChunk} javadoc for how
+     * callers should treat that {@code null}).
+     */
     private CompletionChunk toChunk(JsonNode node) {
         String type = node.path("type").asText("");
         if ("content_block_delta".equals(type)) {

@@ -118,6 +118,7 @@ class OtelEngineListenerTest {
                 .build();
 
         engine.chatStream(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build())
+                .chunks()
                 .forEach(chunk -> { });
 
         SpanData span = spanExporter.getFinishedSpanItems().get(0);

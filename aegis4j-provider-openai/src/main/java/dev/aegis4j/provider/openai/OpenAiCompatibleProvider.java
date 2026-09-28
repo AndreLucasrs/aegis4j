@@ -26,6 +26,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 /**
@@ -107,8 +108,16 @@ public final class OpenAiCompatibleProvider implements Provider {
             throw ProviderHttpErrors.map(id, response.statusCode(), body);
         }
 
+        // OpenAI sends finish_reason on the last in-band content chunk, then a
+        // separate "[DONE]" event with no payload of its own — this holder
+        // carries that reason forward so the CompletionChunk that's actually
+        // marked done() (the one built for "[DONE]") reports the real reason
+        // instead of always guessing "stop".
+        AtomicReference<FinishReason> lastFinishReason = new AtomicReference<>();
         return SseLineParser.dataPayloads(response.body())
-                .map(payload -> "[DONE]".equals(payload) ? CompletionChunk.finished() : toChunk(payload));
+                .map(payload -> "[DONE]".equals(payload)
+                        ? CompletionChunk.finished(lastFinishReason.get())
+                        : toChunk(payload, lastFinishReason));
     }
 
     @Override
@@ -123,9 +132,20 @@ public final class OpenAiCompatibleProvider implements Provider {
         return models.data().stream().map(model -> new ModelInfo(model.id(), model.id(), null)).toList();
     }
 
-    private CompletionChunk toChunk(String payload) {
+    /**
+     * {@code choices} is empty on the usage-only trailing chunk OpenAI sends
+     * when {@code stream_options.include_usage} is requested — a valid
+     * no-op chunk, not an error.
+     */
+    private CompletionChunk toChunk(String payload, AtomicReference<FinishReason> lastFinishReason) {
         OpenAiStreamChunk chunk = parse(payload, OpenAiStreamChunk.class);
+        if (chunk.choices() == null || chunk.choices().isEmpty()) {
+            return CompletionChunk.ofDelta("");
+        }
         OpenAiStreamChoice choice = chunk.choices().get(0);
+        if (choice.finishReason() != null) {
+            lastFinishReason.set(mapFinishReason(choice.finishReason()));
+        }
         String delta = choice.delta() == null || choice.delta().content() == null ? "" : choice.delta().content();
         return CompletionChunk.ofDelta(delta);
     }
