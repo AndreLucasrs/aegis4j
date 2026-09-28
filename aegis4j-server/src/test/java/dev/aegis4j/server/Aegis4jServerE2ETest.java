@@ -3,6 +3,7 @@ package dev.aegis4j.server;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
+import dev.aegis4j.api.provider.ToolDefinition;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.core.engine.Aegis4jEngine;
 import dev.aegis4j.core.guard.GuardChain;
@@ -12,6 +13,7 @@ import dev.aegis4j.core.skill.SkillRegistry;
 import dev.aegis4j.guardrails.builtin.MaxLengthGuard;
 import dev.aegis4j.guardrails.builtin.RegexPiiGuard;
 import dev.aegis4j.provider.ollama.OllamaProvider;
+import dev.aegis4j.provider.openai.OpenAiCompatibleProvider;
 import dev.aegis4j.skills.markdown.MarkdownSkillLoader;
 import io.javalin.Javalin;
 import org.junit.jupiter.api.AfterEach;
@@ -30,6 +32,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Stream;
 
@@ -238,6 +241,45 @@ class Aegis4jServerE2ETest {
         } finally {
             streamingApp.stop();
             streamingWireMock.stop();
+        }
+    }
+
+    @Test
+    void toolCallLimitExceededMapsToStructuredFiveHundredResponse() throws Exception {
+        wireMock.stubFor(post(urlEqualTo("/chat/completions")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"id":"1","model":"gpt-x","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"loop_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+                        """)));
+
+        OpenAiCompatibleProvider openAi = OpenAiCompatibleProvider.custom("openai-test", "http://localhost:" + wireMock.port(), "sk-test");
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(openAi);
+
+        Aegis4jEngine toolEngine = Aegis4jEngine.builder()
+                .providerRegistry(providerRegistry)
+                .tools(List.of(new ToolDefinition("loop_tool", "Loops forever", Map.of())), call -> "result")
+                .maxToolIterations(2)
+                .build();
+
+        Javalin toolApp = Aegis4jServerApp.createApp(toolEngine, "openai-test", null);
+        toolApp.start(0);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + toolApp.port() + "/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""
+                            {"model":"gpt-x","messages":[{"role":"user","content":"loop forever"}]}
+                            """))
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            assertThat(response.statusCode()).isEqualTo(500);
+            JsonNode body = mapper.readTree(response.body());
+            assertThat(body.at("/error/code").asText()).isEqualTo("tool_call_limit_exceeded");
+        } finally {
+            toolApp.stop();
         }
     }
 

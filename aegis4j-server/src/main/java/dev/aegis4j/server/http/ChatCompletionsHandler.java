@@ -13,6 +13,7 @@ import dev.aegis4j.api.provider.Role;
 import dev.aegis4j.core.engine.Aegis4jEngine;
 import dev.aegis4j.core.engine.ChatRequest;
 import dev.aegis4j.core.engine.StreamedCompletion;
+import dev.aegis4j.core.engine.ToolCallLimitExceededException;
 import dev.aegis4j.core.guard.GuardBlockedException;
 import dev.aegis4j.server.dto.ChatChoiceDto;
 import dev.aegis4j.server.dto.ChatChunkChoiceDto;
@@ -98,6 +99,8 @@ public final class ChatCompletionsHandler implements Handler {
             ctx.result(mapper.writeValueAsString(toDto(response)));
         } catch (GuardBlockedException e) {
             writeJsonError(ctx, 400, e.reasonCode(), e.getMessage());
+        } catch (ToolCallLimitExceededException e) {
+            writeJsonError(ctx, 500, e.code(), e.getMessage());
         }
     }
 

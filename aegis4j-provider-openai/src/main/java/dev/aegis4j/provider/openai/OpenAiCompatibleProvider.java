@@ -12,6 +12,8 @@ import dev.aegis4j.api.provider.ModelInfo;
 import dev.aegis4j.api.provider.Provider;
 import dev.aegis4j.api.provider.ProviderException;
 import dev.aegis4j.api.provider.ProviderTimeoutException;
+import dev.aegis4j.api.provider.ToolCall;
+import dev.aegis4j.api.provider.ToolDefinition;
 import dev.aegis4j.api.provider.Usage;
 import dev.aegis4j.provider.http.ProviderHttpErrors;
 import dev.aegis4j.provider.http.SseLineParser;
@@ -94,7 +96,7 @@ public final class OpenAiCompatibleProvider implements Provider {
 
         return new CompletionResponse(
                 chatResponse.id(), chatResponse.model(), choice.message().content(),
-                mapFinishReason(choice.finishReason()), usage, List.of()
+                mapFinishReason(choice.finishReason()), usage, toToolCalls(choice.message())
         );
     }
 
@@ -164,7 +166,10 @@ public final class OpenAiCompatibleProvider implements Provider {
         List<OpenAiMessage> messages = request.messages().stream()
                 .map(this::toOpenAiMessage)
                 .toList();
-        OpenAiChatRequest body = new OpenAiChatRequest(request.model(), messages, stream, request.temperature(), request.maxTokens());
+        List<OpenAiTool> tools = request.tools() == null || request.tools().isEmpty()
+                ? null
+                : request.tools().stream().map(this::toOpenAiTool).toList();
+        OpenAiChatRequest body = new OpenAiChatRequest(request.model(), messages, stream, request.temperature(), request.maxTokens(), tools);
 
         return authorizedBuilder(URI.create(baseUrl + "/chat/completions"))
                 .POST(HttpRequest.BodyPublishers.ofString(writeJson(body)))
@@ -172,7 +177,25 @@ public final class OpenAiCompatibleProvider implements Provider {
     }
 
     private OpenAiMessage toOpenAiMessage(Message message) {
-        return new OpenAiMessage(message.role().name().toLowerCase(Locale.ROOT), message.content());
+        List<OpenAiToolCall> toolCalls = message.toolCalls().isEmpty()
+                ? null
+                : message.toolCalls().stream()
+                        .map(call -> OpenAiToolCall.function(call.id(), new OpenAiFunctionCall(call.name(), call.argumentsJson())))
+                        .toList();
+        return new OpenAiMessage(message.role().name().toLowerCase(Locale.ROOT), message.content(), toolCalls, message.toolCallId());
+    }
+
+    private OpenAiTool toOpenAiTool(ToolDefinition definition) {
+        return OpenAiTool.function(new OpenAiFunctionDef(definition.name(), definition.description(), definition.parametersSchema()));
+    }
+
+    private List<ToolCall> toToolCalls(OpenAiMessage message) {
+        if (message.toolCalls() == null || message.toolCalls().isEmpty()) {
+            return List.of();
+        }
+        return message.toolCalls().stream()
+                .map(call -> new ToolCall(call.id(), call.function().name(), call.function().arguments()))
+                .toList();
     }
 
     private HttpRequest.Builder authorizedBuilder(URI uri) {
