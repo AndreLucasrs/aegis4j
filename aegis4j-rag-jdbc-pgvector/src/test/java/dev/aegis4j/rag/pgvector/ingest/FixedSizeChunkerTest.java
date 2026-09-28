@@ -77,4 +77,20 @@ class FixedSizeChunkerTest {
             assertThat(Character.isHighSurrogate(chunk.charAt(chunk.length() - 1))).isFalse();
         }
     }
+
+    @Test
+    void neverDuplicatesAChunkWhenAdjacentSurrogatePairsForceWindowWidening() {
+        // Regression test: with chunkSize=1, two adjacent emojis (each a surrogate pair) used to
+        // make the surrogate-pair adjustment nudge the second window's start back to the first
+        // window's start, re-emitting the same chunk before the independently-adjusted next raw
+        // start produced the second emoji's chunk. That produced 3 chunks (two of them identical)
+        // instead of the correct 2.
+        String text = "😀😀";
+        FixedSizeChunker chunker = new FixedSizeChunker(1, 0);
+
+        List<String> chunks = chunker.chunk(text);
+
+        assertThat(chunks).containsExactly("😀", "😀");
+        assertThat(String.join("", chunks)).isEqualTo(text);
+    }
 }

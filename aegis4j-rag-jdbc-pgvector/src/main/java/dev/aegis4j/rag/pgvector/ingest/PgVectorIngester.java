@@ -10,6 +10,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 /**
@@ -19,16 +20,26 @@ import java.util.List;
  * {@link PgVectorRetrieverConfig} passed to the retriever, so ingestion and
  * retrieval never drift apart on schema.
  *
- * <p>Every chunk is embedded up front, before any JDBC connection is opened
- * — a connection (and a slot in whatever pool backs the {@link DataSource})
- * is only held for the write step, not for the duration of a slow/remote
- * embedding call per chunk.
+ * <p>Documents are processed one at a time: a document's chunks are embedded
+ * and written in slices of at most {@code batchFlushSize}, instead of
+ * embedding the whole corpus into memory before the first row is ever
+ * written. This keeps memory bounded for a large ingestion run — only one
+ * document's in-flight slice of vectors is ever held at once — and a
+ * mid-corpus failure only loses the batch in flight, not work already
+ * flushed. A JDBC connection (and a slot in whatever pool backs the
+ * {@link DataSource}) is opened once for the whole {@link #ingest} call, not
+ * per document.
  *
  * <p>Writes use {@code ON CONFLICT ... DO UPDATE}, so re-running ingestion
  * over the same documents (a scheduled re-sync, a retry, a content update)
  * replaces existing rows instead of aborting the whole batch on a duplicate
  * key. This requires the configured {@code idColumn} to carry a unique or
- * primary key constraint.
+ * primary key constraint. After a document's chunks are upserted, any row
+ * left over from a previous ingestion of that same document — one whose id
+ * still starts with {@code <documentId>#} but is no longer among the ids the
+ * new chunk list produces, e.g. because the document shrank from 5 chunks to
+ * 2 — is deleted, so reingestion actually replaces a document's rows instead
+ * of only ever adding to or updating them.
  */
 public final class PgVectorIngester {
 
@@ -45,9 +56,11 @@ public final class PgVectorIngester {
     }
 
     /**
-     * @param batchFlushSize how many chunks to accumulate in a single JDBC batch before
-     *                       flushing (executeBatch + clearBatch); keeps memory bounded and
-     *                       a mid-corpus failure from discarding an entire large ingestion run
+     * @param batchFlushSize how many chunks to embed and accumulate in a single JDBC batch
+     *                       before flushing (executeBatch + clearBatch) and moving on; also the
+     *                       most in-flight embedded chunks (vectors included) ever held in memory
+     *                       at once, since chunks are embedded incrementally into each slice
+     *                       rather than the whole document/corpus being embedded up front
      */
     public PgVectorIngester(DataSource dataSource, Embedder embedder, PgVectorRetrieverConfig config, Chunker chunker,
                              int batchFlushSize) {
@@ -76,20 +89,28 @@ public final class PgVectorIngester {
      * @return the number of chunks written
      */
     public int ingest(Iterable<Document> documents) {
-        validateEmbeddingDimension();
-
-        List<EmbeddedChunk> embeddedChunks = new ArrayList<>();
-        for (Document document : documents) {
-            validateDocument(document);
-            List<String> chunks = chunker.chunk(document.content());
-            for (int i = 0; i < chunks.size(); i++) {
-                String chunkText = chunks.get(i);
-                embeddedChunks.add(new EmbeddedChunk(document.id() + "#" + i, chunkText, embedder.embed(chunkText)));
-            }
+        if (documents instanceof Collection<?> collection && collection.isEmpty()) {
+            // Cheap, common-case (List-returning DocumentLoader) short circuit: skips both the
+            // dimension pre-flight and opening a write connection when there is no work at all.
+            return 0;
         }
 
-        writeChunks(embeddedChunks);
-        return embeddedChunks.size();
+        validateEmbeddingDimension();
+
+        // The write connection/statements are opened lazily, on the first document that passes
+        // validateDocument, and reused for every document after that — not one connection per
+        // document, and not before an earlier invalid document has had a chance to fail fast
+        // without ever touching the database (see WriteSession.ensureOpen).
+        try (WriteSession session = new WriteSession()) {
+            int totalChunks = 0;
+            for (Document document : documents) {
+                validateDocument(document);
+                totalChunks += session.ingestDocument(document);
+            }
+            return totalChunks;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to ingest documents into pgvector table " + config.table(), e);
+        }
     }
 
     private void validateDocument(Document document) {
@@ -133,32 +154,6 @@ public final class PgVectorIngester {
         }
     }
 
-    private void writeChunks(List<EmbeddedChunk> embeddedChunks) {
-        try (Connection connection = dataSource.getConnection()) {
-            PGvector.addVectorType(connection);
-            try (PreparedStatement statement = connection.prepareStatement(buildUpsert())) {
-                int pending = 0;
-                for (EmbeddedChunk chunk : embeddedChunks) {
-                    statement.setString(1, chunk.id());
-                    statement.setString(2, chunk.content());
-                    statement.setObject(3, new PGvector(chunk.vector()));
-                    statement.addBatch();
-                    pending++;
-                    if (pending >= batchFlushSize) {
-                        statement.executeBatch();
-                        statement.clearBatch();
-                        pending = 0;
-                    }
-                }
-                if (pending > 0) {
-                    statement.executeBatch();
-                }
-            }
-        } catch (SQLException e) {
-            throw new IllegalStateException("Failed to ingest documents into pgvector table " + config.table(), e);
-        }
-    }
-
     private String buildUpsert() {
         return "INSERT INTO " + config.table() + " (" + config.idColumn() + ", " + config.contentColumn() + ", "
                 + config.embeddingColumn() + ") VALUES (?, ?, ?) "
@@ -167,6 +162,117 @@ public final class PgVectorIngester {
                 + config.embeddingColumn() + " = EXCLUDED." + config.embeddingColumn();
     }
 
-    private record EmbeddedChunk(String id, String content, float[] vector) {
+    /**
+     * Deletes rows whose id belongs to a document (matched by the {@code <documentId>#} prefix
+     * convention {@link #ingest} writes ids with) but is not one of that document's current chunk
+     * ids — i.e. rows left over from a previous ingestion of the same document that produced more
+     * chunks than the new content does. {@code <> ALL(?)} against a bound {@code text[]} lets one
+     * prepared statement handle any number of current ids, including zero (an empty array makes
+     * {@code <> ALL(...)} true for every row, correctly deleting every chunk of a document whose
+     * new content chunks to nothing).
+     */
+    private String buildOrphanDelete() {
+        return "DELETE FROM " + config.table() + " WHERE " + config.idColumn() + " LIKE ? ESCAPE '\\' AND "
+                + config.idColumn() + " <> ALL(?)";
+    }
+
+    /**
+     * Builds the {@code <documentId>#} LIKE prefix pattern, escaping the id's own {@code %} and
+     * {@code _} characters (e.g. a filename-derived id containing an underscore) so they are
+     * matched literally instead of acting as SQL wildcards — otherwise this delete could match,
+     * and remove, chunks belonging to an unrelated document.
+     */
+    private static String likePattern(String documentId) {
+        return documentId.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "#%";
+    }
+
+    /**
+     * Owns the single JDBC connection and the two prepared statements (upsert, orphan delete)
+     * used across every document in one {@link #ingest} call. Opened lazily on the first document
+     * that reaches {@link #ingestDocument} — never for a document that {@code validateDocument}
+     * rejects first, and never at all for an ingestion that turns out to have no valid documents.
+     */
+    private final class WriteSession implements AutoCloseable {
+
+        private Connection connection;
+        private PreparedStatement upsert;
+        private PreparedStatement deleteOrphans;
+
+        /**
+         * Embeds and writes one document's chunks in slices of at most {@code batchFlushSize} —
+         * a chunk is only embedded right before it is added to the pending JDBC batch, so at most
+         * one slice's worth of vectors is ever held in memory, never the whole document (let
+         * alone the whole corpus) — then deletes that document's orphaned rows, if any.
+         */
+        int ingestDocument(Document document) throws SQLException {
+            ensureOpen();
+
+            List<String> chunks = chunker.chunk(document.content());
+            List<String> currentIds = new ArrayList<>(chunks.size());
+            int pending = 0;
+            for (int i = 0; i < chunks.size(); i++) {
+                String chunkText = chunks.get(i);
+                String id = document.id() + "#" + i;
+                currentIds.add(id);
+                upsert.setString(1, id);
+                upsert.setString(2, chunkText);
+                upsert.setObject(3, new PGvector(embedder.embed(chunkText)));
+                upsert.addBatch();
+                pending++;
+                if (pending >= batchFlushSize) {
+                    upsert.executeBatch();
+                    upsert.clearBatch();
+                    pending = 0;
+                }
+            }
+            if (pending > 0) {
+                upsert.executeBatch();
+                upsert.clearBatch();
+            }
+
+            deleteOrphans.setString(1, likePattern(document.id()));
+            deleteOrphans.setArray(2, connection.createArrayOf("text", currentIds.toArray(new String[0])));
+            deleteOrphans.executeUpdate();
+
+            return chunks.size();
+        }
+
+        private void ensureOpen() throws SQLException {
+            if (connection == null) {
+                connection = dataSource.getConnection();
+                PGvector.addVectorType(connection);
+                upsert = connection.prepareStatement(buildUpsert());
+                deleteOrphans = connection.prepareStatement(buildOrphanDelete());
+            }
+        }
+
+        @Override
+        public void close() throws SQLException {
+            if (connection == null) {
+                return;
+            }
+            // Close every resource even if an earlier one fails, statements before the connection,
+            // surfacing the first failure and suppressing the rest rather than losing them.
+            SQLException failure = closeQuietly(deleteOrphans, null);
+            failure = closeQuietly(upsert, failure);
+            failure = closeQuietly(connection, failure);
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        private SQLException closeQuietly(AutoCloseable resource, SQLException previousFailure) {
+            try {
+                resource.close();
+                return previousFailure;
+            } catch (Exception e) {
+                SQLException failure = e instanceof SQLException sqlException ? sqlException : new SQLException(e);
+                if (previousFailure != null) {
+                    previousFailure.addSuppressed(failure);
+                    return previousFailure;
+                }
+                return failure;
+            }
+        }
     }
 }

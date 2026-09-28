@@ -120,4 +120,39 @@ class PgVectorIngesterIntegrationTest {
             assertThat(resultSet.getString(2)).isEqualTo("second version of the content");
         }
     }
+
+    @Test
+    void reingestingWithFewerChunksDeletesTheNowOrphanedRows(@TempDir Path directory) throws Exception {
+        // Dedicated table so this test's rows never interact with the other tests' rows.
+        String table = "orphan_cleanup_chunks";
+        DataSource dataSource = dataSource();
+        try (Connection connection = dataSource.getConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE " + table + " (id text primary key, content text, embedding vector("
+                    + DIMENSIONS + "))");
+        }
+
+        Embedder embedder = new HashEmbedder(DIMENSIONS);
+        PgVectorRetrieverConfig config = PgVectorRetrieverConfig.defaults(table);
+        // chunkSize=5, no overlap: "abcdefghij" (10 chars) chunks into 2, "ab" chunks into 1.
+        PgVectorIngester ingester = new PgVectorIngester(dataSource, embedder, config, new FixedSizeChunker(5, 0));
+
+        Files.writeString(directory.resolve("doc.txt"), "abcdefghij");
+        int firstChunkCount = ingester.ingest(new TextDocumentLoader(directory));
+        assertThat(firstChunkCount).isEqualTo(2);
+
+        // Same document, now shorter: it chunks to just doc.txt#0, leaving doc.txt#1 an orphan
+        // that a plain upsert would never touch.
+        Files.writeString(directory.resolve("doc.txt"), "ab");
+        int secondChunkCount = ingester.ingest(new TextDocumentLoader(directory));
+        assertThat(secondChunkCount).isEqualTo(1);
+
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement();
+             ResultSet resultSet = statement.executeQuery("SELECT id, content FROM " + table)) {
+            assertThat(resultSet.next()).isTrue();
+            assertThat(resultSet.getString("id")).isEqualTo("doc.txt#0");
+            assertThat(resultSet.getString("content")).isEqualTo("ab");
+            assertThat(resultSet.next()).isFalse();
+        }
+    }
 }

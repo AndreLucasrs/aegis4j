@@ -57,4 +57,27 @@ class TextDocumentLoaderTest {
         assertThat(documents.get(0).id()).isEqualTo("good.txt");
         assertThat(documents.get(0).content()).isEqualTo("readable content");
     }
+
+    @Test
+    void matchesTheExtensionCaseInsensitively(@TempDir Path directory) throws IOException {
+        // Linux (the typical production filesystem) is case-sensitive, so README.MD would
+        // otherwise be silently skipped by a ".md" glob with no log or error.
+        Files.writeString(directory.resolve("README.MD"), "upper case extension");
+        Files.writeString(directory.resolve("notes.Md"), "mixed case extension");
+
+        List<Document> documents = new MarkdownDocumentLoader(directory).load();
+
+        assertThat(documents).extracting(Document::id).containsExactlyInAnyOrder("README.MD", "notes.Md");
+    }
+
+    @Test
+    void loadsFilesInSortedOrderForDeterministicIngestion(@TempDir Path directory) throws IOException {
+        Files.writeString(directory.resolve("c.txt"), "c");
+        Files.writeString(directory.resolve("a.txt"), "a");
+        Files.writeString(directory.resolve("b.txt"), "b");
+
+        List<Document> documents = new TextDocumentLoader(directory).load();
+
+        assertThat(documents).extracting(Document::id).containsExactly("a.txt", "b.txt", "c.txt");
+    }
 }
