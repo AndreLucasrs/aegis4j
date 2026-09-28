@@ -27,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 /**
@@ -105,9 +106,16 @@ public final class AnthropicProvider implements Provider {
             throw ProviderHttpErrors.map(ID, response.statusCode(), body);
         }
 
+        // Anthropic's real stop reason arrives earlier, on a "message_delta"
+        // event's delta.stop_reason, ahead of the terminal "message_stop"
+        // event (which carries no payload of its own) — this holder carries
+        // it forward, mirroring OpenAiCompatibleProvider.stream()'s
+        // lastFinishReason handling for the same "reason arrives before the
+        // terminal chunk" shape.
+        AtomicReference<FinishReason> lastFinishReason = new AtomicReference<>();
         return SseLineParser.dataPayloads(response.body())
                 .map(this::parse)
-                .map(this::toChunk)
+                .map(node -> toChunk(node, lastFinishReason))
                 .filter(chunk -> chunk != null);
     }
 
@@ -127,19 +135,28 @@ public final class AnthropicProvider implements Provider {
     }
 
     /**
-     * The actual stop reason arrives earlier, on a {@code message_delta}
-     * event's {@code delta.stop_reason} — not tracked here yet, so the
-     * terminal chunk built from {@code message_stop} carries no
-     * {@link FinishReason} (see {@link CompletionChunk} javadoc for how
-     * callers should treat that {@code null}).
+     * {@code message_delta} carries the real stop reason but no text and
+     * isn't itself a chunk the caller should see, so it only updates
+     * {@code lastFinishReason} and returns {@code null} (filtered out by the
+     * caller); the terminal chunk is only built once {@code message_stop}
+     * arrives, at which point it reports whatever reason was last captured
+     * (still {@code null} if no {@code message_delta} carried one — see
+     * {@link CompletionChunk} javadoc for how callers should treat that).
      */
-    private CompletionChunk toChunk(JsonNode node) {
+    private CompletionChunk toChunk(JsonNode node, AtomicReference<FinishReason> lastFinishReason) {
         String type = node.path("type").asText("");
         if ("content_block_delta".equals(type)) {
             return CompletionChunk.ofDelta(node.path("delta").path("text").asText(""));
         }
+        if ("message_delta".equals(type)) {
+            String stopReason = node.path("delta").path("stop_reason").asText(null);
+            if (stopReason != null) {
+                lastFinishReason.set(mapStopReason(stopReason));
+            }
+            return null;
+        }
         if ("message_stop".equals(type)) {
-            return CompletionChunk.finished();
+            return CompletionChunk.finished(lastFinishReason.get());
         }
         return null;
     }

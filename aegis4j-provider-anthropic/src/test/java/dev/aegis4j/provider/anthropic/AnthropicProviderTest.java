@@ -4,6 +4,7 @@ import com.github.tomakehurst.wiremock.WireMockServer;
 import dev.aegis4j.api.provider.CompletionChunk;
 import dev.aegis4j.api.provider.CompletionRequest;
 import dev.aegis4j.api.provider.CompletionResponse;
+import dev.aegis4j.api.provider.FinishReason;
 import dev.aegis4j.api.provider.Message;
 import dev.aegis4j.api.provider.ProviderAuthException;
 import org.junit.jupiter.api.AfterEach;
@@ -99,6 +100,39 @@ class AnthropicProviderTest {
         assertThat(chunks).hasSize(3);
         assertThat(chunks.get(0).deltaContent() + chunks.get(1).deltaContent()).isEqualTo("hello");
         assertThat(chunks.get(2).done()).isTrue();
+    }
+
+    @Test
+    void streamPropagatesRealStopReasonFromMessageDeltaEvent() {
+        wireMock.stubFor(post(urlEqualTo("/v1/messages")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "text/event-stream")
+                .withBody("""
+                        event: content_block_delta
+                        data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}
+
+                        event: message_delta
+                        data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":5}}
+
+                        event: message_stop
+                        data: {"type":"message_stop"}
+
+                        """)));
+
+        List<CompletionChunk> chunks;
+        try (var stream = provider.stream(CompletionRequest.builder()
+                .model("claude-sonnet-5")
+                .messages(List.of(Message.user("hi")))
+                .build())) {
+            chunks = stream.toList();
+        }
+
+        // message_delta itself carries no text and isn't surfaced as its own
+        // chunk — only the delta and the terminal chunk are.
+        assertThat(chunks).hasSize(2);
+        CompletionChunk terminal = chunks.get(1);
+        assertThat(terminal.done()).isTrue();
+        assertThat(terminal.finishReason()).isEqualTo(FinishReason.LENGTH);
     }
 
     @Test

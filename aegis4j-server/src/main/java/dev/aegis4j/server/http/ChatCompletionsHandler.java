@@ -97,10 +97,15 @@ public final class ChatCompletionsHandler implements Handler {
             CompletionResponse response = engine.chat(chatRequest);
             ctx.contentType("application/json");
             ctx.result(mapper.writeValueAsString(toDto(response)));
-        } catch (GuardBlockedException e) {
-            writeJsonError(ctx, 400, e.reasonCode(), e.getMessage());
-        } catch (ToolCallLimitExceededException e) {
-            writeJsonError(ctx, 500, e.code(), e.getMessage());
+        } catch (GuardBlockedException | IllegalStateException | NoSuchElementException
+                | ProviderException | ToolCallLimitExceededException e) {
+            // Same exception surface Aegis4jEngine#chat can throw (guard block,
+            // routing misconfigured, unknown provider, the provider itself
+            // failing, or the tool-calling loop giving up) mapped through the
+            // same {@link #mapError} lookup handleStreaming() uses for its
+            // pre-stream errors, so the two paths can't drift apart on status/code.
+            ErrorMapping mapping = mapError(e);
+            writeJsonError(ctx, mapping.httpStatus(), mapping.code(), e.getMessage());
         }
     }
 
@@ -113,22 +118,29 @@ public final class ChatCompletionsHandler implements Handler {
      * id) and {@link ProviderException} (the provider rejected the request,
      * timed out, etc. while opening the connection) are all still reported
      * here as a normal HTTP error, exactly like the non-streaming path — no
-     * SSE bytes have been written yet at this point.
+     * SSE bytes have been written yet at this point. (See {@link #handle}:
+     * it catches this same set, plus {@link ToolCallLimitExceededException}
+     * which only {@link Aegis4jEngine#chat} can throw, through the same
+     * {@link #mapError} lookup.)
      *
      * <p>Once the first byte is written the response is committed to 200
      * {@code text/event-stream} and the HTTP status can no longer change;
      * any exception raised while pulling further chunks (the same types
-     * above, or anything else the provider's lazy stream throws) is instead
-     * reported as a best-effort {@code data:} event using the same
+     * above, anything else the provider's lazy stream throws, or a
+     * {@code JsonProcessingException} serializing a chunk to JSON) is
+     * instead reported as a best-effort {@code data:} event using the same
      * {@code {"error": {"code": ..., "message": ...}}} shape, followed by
-     * {@code data: [DONE]}.
+     * {@code data: [DONE]} — that terminator is always written, even when
+     * the failure happens mid-loop, so a client is never left waiting on a
+     * stream that silently died.
      */
     private void handleStreaming(Context ctx, ChatRequest chatRequest) throws IOException {
         StreamedCompletion streamed;
         try {
             streamed = engine.chatStream(chatRequest);
         } catch (GuardBlockedException | IllegalStateException | NoSuchElementException | ProviderException e) {
-            writeJsonError(ctx, httpStatusFor(e), errorCodeFor(e), e.getMessage());
+            ErrorMapping mapping = mapError(e);
+            writeJsonError(ctx, mapping.httpStatus(), mapping.code(), e.getMessage());
             return;
         }
 
@@ -151,9 +163,14 @@ public final class ChatCompletionsHandler implements Handler {
                 sseWriter.writeJson(mapper.writeValueAsBytes(dto));
                 roleSent = true;
             }
-        } catch (RuntimeException e) {
+        } catch (Exception e) {
+            // Exception, not RuntimeException: mapper.writeValueAsBytes above can
+            // throw the checked JsonProcessingException, which a narrower catch
+            // would let escape this method entirely, skipping writeDone() below
+            // and leaving an SSE client waiting forever for a [DONE] that never
+            // comes.
             String message = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-            ErrorResponseDto errorDto = new ErrorResponseDto(new ErrorDetailDto(errorCodeFor(e), message));
+            ErrorResponseDto errorDto = new ErrorResponseDto(new ErrorDetailDto(mapError(e).code(), message));
             sseWriter.writeJson(mapper.writeValueAsBytes(errorDto));
         }
         sseWriter.writeDone();
@@ -181,48 +198,50 @@ public final class ChatCompletionsHandler implements Handler {
         ctx.result(mapper.writeValueAsString(new ErrorResponseDto(new ErrorDetailDto(code, message))));
     }
 
-    private int httpStatusFor(RuntimeException e) {
-        if (e instanceof GuardBlockedException || e instanceof NoSuchElementException) {
-            return 400;
-        }
-        if (e instanceof ProviderAuthException authError) {
-            return authError.httpStatus() > 0 ? authError.httpStatus() : 401;
-        }
-        if (e instanceof ProviderRateLimitException rateLimited) {
-            return rateLimited.httpStatus() > 0 ? rateLimited.httpStatus() : 429;
-        }
-        if (e instanceof ProviderTimeoutException) {
-            return 504;
-        }
-        if (e instanceof ProviderException) {
-            return 502;
-        }
-        return 500;
+    /** {@code (httpStatus, code)} pair for one mapped exception; see {@link #mapError}. */
+    private record ErrorMapping(int httpStatus, String code) {
     }
 
-    private String errorCodeFor(RuntimeException e) {
+    /**
+     * Single {@code (httpStatus, code)} lookup for every exception either
+     * {@link #handle} or {@link #handleStreaming} can see. Used to be two
+     * separate {@code instanceof} ladders ({@code httpStatusFor}/
+     * {@code errorCodeFor}) covering the same exception hierarchy, which
+     * could silently drift apart (e.g. one branch's status forgetting to
+     * match its neighbor's code) — collapsing them into one lookup makes
+     * that impossible.
+     */
+    private ErrorMapping mapError(Exception e) {
         if (e instanceof GuardBlockedException guardBlocked) {
-            return guardBlocked.reasonCode();
+            return new ErrorMapping(400, guardBlocked.reasonCode());
         }
         if (e instanceof NoSuchElementException) {
-            return "unknown_provider";
+            return new ErrorMapping(400, "unknown_provider");
         }
         if (e instanceof IllegalStateException) {
-            return "routing_error";
+            return new ErrorMapping(500, "routing_error");
         }
-        if (e instanceof ProviderAuthException) {
-            return "provider_auth_error";
+        if (e instanceof ToolCallLimitExceededException toolCallLimitExceeded) {
+            return new ErrorMapping(500, toolCallLimitExceeded.code());
         }
-        if (e instanceof ProviderRateLimitException) {
-            return "provider_rate_limited";
+        if (e instanceof ProviderAuthException authError) {
+            return new ErrorMapping(authError.httpStatus() > 0 ? authError.httpStatus() : 401, "provider_auth_error");
+        }
+        if (e instanceof ProviderRateLimitException rateLimited) {
+            return new ErrorMapping(rateLimited.httpStatus() > 0 ? rateLimited.httpStatus() : 429, "provider_rate_limited");
         }
         if (e instanceof ProviderTimeoutException) {
-            return "provider_timeout";
+            return new ErrorMapping(504, "provider_timeout");
         }
-        if (e instanceof ProviderException) {
-            return "provider_error";
+        if (e instanceof ProviderException providerError) {
+            // Was hardcoded to 502 regardless of what the provider actually
+            // reported (e.g. a 404 for an unknown model would be masked as
+            // "Bad Gateway"); ProviderAuthException/ProviderRateLimitException
+            // right above already do this correctly, so the generic case now
+            // matches them instead of being the odd one out.
+            return new ErrorMapping(providerError.httpStatus() > 0 ? providerError.httpStatus() : 502, "provider_error");
         }
-        return "internal_error";
+        return new ErrorMapping(500, "internal_error");
     }
 
     private ChatCompletionResponseDto toDto(CompletionResponse response) {

@@ -100,6 +100,22 @@ public final class OpenAiCompatibleProvider implements Provider {
         );
     }
 
+    /**
+     * <b>Known limitation:</b> a backend that mirrors the OpenAI wire format
+     * for in-band chunks but never sends the trailing {@code data: [DONE]}
+     * sentinel (some non-compliant OpenAI-compatible proxies just close the
+     * connection after the last content chunk) never produces a
+     * {@link CompletionChunk} with {@code done() == true} here — the
+     * returned {@link Stream} simply ends. {@code ChatCompletionsHandler}
+     * still terminates its SSE response correctly (it always writes its own
+     * {@code data: [DONE]}), but the client never receives a
+     * {@code finish_reason} for that turn. Treating "the underlying stream
+     * ended without [DONE]" as an implicit final chunk would need this
+     * method to buffer or peek one element ahead, which isn't worth the
+     * complexity for a non-compliant backend; call sites that need a
+     * reliable {@code finish_reason} should prefer a fully OpenAI-compliant
+     * backend.
+     */
     @Override
     public Stream<CompletionChunk> stream(CompletionRequest request) {
         HttpResponse<Stream<String>> response = send(buildRequest(request, true), HttpResponse.BodyHandlers.ofLines());
