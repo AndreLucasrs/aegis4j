@@ -34,9 +34,11 @@ public final class BearerAuthHandler implements Handler {
         }
 
         String token = bearerToken(ctx.header("Authorization"));
-        // MessageDigest.isEqual runs in constant time regardless of where the
-        // arrays first differ, unlike String.equals, so it doesn't leak the
-        // key's length/prefix through response-time differences.
+        // MessageDigest.isEqual compares in constant time with respect to the
+        // *contents* of equal-length arrays, unlike String.equals, so it doesn't
+        // leak where in the key two candidates first differ. It still short-circuits
+        // on a length mismatch, which in theory leaks the key's length via timing —
+        // low severity and impractical to exploit here, but worth naming precisely.
         if (token == null || !MessageDigest.isEqual(token.getBytes(StandardCharsets.UTF_8), expectedApiKeyBytes)) {
             ctx.status(401).contentType("application/json");
             ctx.result(mapper.writeValueAsString(Map.of(
@@ -47,7 +49,11 @@ public final class BearerAuthHandler implements Handler {
     }
 
     private static String bearerToken(String authorizationHeader) {
-        if (authorizationHeader == null || !authorizationHeader.startsWith(BEARER_PREFIX)) {
+        // RFC 7235 auth-scheme names are case-insensitive, so "bearer"/"BEARER"/"Bearer"
+        // must all be accepted.
+        if (authorizationHeader == null
+                || authorizationHeader.length() < BEARER_PREFIX.length()
+                || !authorizationHeader.regionMatches(true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length())) {
             return null;
         }
         return authorizationHeader.substring(BEARER_PREFIX.length());

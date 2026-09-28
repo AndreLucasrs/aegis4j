@@ -106,6 +106,7 @@ Variáveis de ambiente (todas opcionais):
 | `AEGIS4J_PROVIDER_ID`         | `ollama`                  | Provider ativo                                           |
 | `AEGIS4J_OLLAMA_BASE_URL`     | `http://localhost:11434`  | Base URL do Ollama                                       |
 | `AEGIS4J_MAX_INPUT_CHARS`     | `4000`                    | Teto de caracteres de input (guard `MaxLengthGuard`)      |
+| `AEGIS4J_SERVER_API_KEY`      | *(nenhum)*                | Protege o próprio servidor: se setada, todo request para endpoints não-`/health` precisa do header `Authorization: Bearer <chave>`, senão retorna `401`. Se não setada, o servidor fica aberto (comportamento padrão, compatível com versões anteriores) |
 | `AEGIS4J_SKILLS_DIR`          | *(nenhum)*                | Diretório com skills declarativas (`.md` + frontmatter)   |
 | `AEGIS4J_RETRIEVER`           | *(nenhum)*                | `mcp` — ativa retrieval via MCP (`pgvector` lança erro explícito em v0.2, ver [limitações](#escopo-e-limitações-v02)) |
 | `AEGIS4J_MCP_RETRIEVER_TRANSPORT` | *(nenhum)*            | `stdio` ou `http`                                          |
