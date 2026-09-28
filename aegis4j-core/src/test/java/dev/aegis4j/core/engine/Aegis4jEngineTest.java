@@ -317,7 +317,8 @@ class Aegis4jEngineTest {
         assertThat(secondRequestMessages)
                 .anySatisfy(m -> {
                     assertThat(m.role()).isEqualTo(Role.TOOL);
-                    assertThat(m.content()).contains("broken_tool").contains("boom");
+                    assertThat(m.content()).contains("broken_tool").contains("IllegalStateException");
+                    assertThat(m.content()).doesNotContain("boom");
                 });
     }
 
@@ -340,5 +341,83 @@ class Aegis4jEngineTest {
         assertThatThrownBy(() -> engine.chat(ChatRequest.builder()
                 .providerId("fake").model("m").userInput("loop forever").build()))
                 .isInstanceOf(ToolCallLimitExceededException.class);
+    }
+
+    @Test
+    void maxToolIterationsCapsTotalProviderCallsIncludingTheInitialOne() {
+        ToolDefinition loopingTool = new ToolDefinition("looping_tool", "Never stops calling itself", Map.of());
+        AtomicInteger callCount = new AtomicInteger();
+
+        FakeProvider provider = FakeProvider.withId("fake").respondingWithFullResponse(request -> {
+            ToolCall call = new ToolCall("call-" + callCount.incrementAndGet(), "looping_tool", "{}");
+            return new CompletionResponse("id", request.model(), null, FinishReason.TOOL_CALLS, Usage.UNKNOWN, List.of(call));
+        });
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .tools(List.of(loopingTool), toolCall -> "result")
+                .maxToolIterations(3)
+                .build();
+
+        assertThatThrownBy(() -> engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("loop forever").build()))
+                .isInstanceOf(ToolCallLimitExceededException.class);
+
+        assertThat(provider.receivedRequests()).hasSize(3);
+    }
+
+    @Test
+    void guardChainDoesNotNpeWhenFinalResponseContentIsNull() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWithFullResponse(request ->
+                new CompletionResponse("id", request.model(), null, FinishReason.STOP, Usage.UNKNOWN, List.of()));
+
+        Guard nullSafetyProbe = new Guard() {
+            @Override
+            public String id() {
+                return "null-safety-probe";
+            }
+
+            @Override
+            public GuardResult checkInput(GuardContext ctx, String text) {
+                return GuardResult.pass();
+            }
+
+            @Override
+            public GuardResult checkOutput(GuardContext ctx, String text) {
+                return GuardResult.modify(text + "[checked]", "appended");
+            }
+        };
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .guardChain(GuardChain.of(nullSafetyProbe))
+                .build();
+
+        CompletionResponse response = engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("hi").build());
+
+        assertThat(response.content()).isEqualTo("[checked]");
+    }
+
+    @Test
+    void toolsThrowsWhenDefinitionsProvidedWithoutAnExecutor() {
+        ToolDefinition tool = new ToolDefinition("some_tool", "does something", Map.of());
+        Aegis4jEngine.Builder builder = Aegis4jEngine.builder();
+
+        assertThatThrownBy(() -> builder.tools(List.of(tool), null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void toolsIsANoOpWhenBothDefinitionsAndExecutorAreNull() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .tools(null, null)
+                .build();
+
+        engine.chat(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build());
+
+        assertThat(provider.lastRequest().tools()).isEmpty();
     }
 }

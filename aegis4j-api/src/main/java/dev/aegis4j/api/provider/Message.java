@@ -13,6 +13,16 @@ import java.util.List;
 public record Message(Role role, String content, List<ToolCall> toolCalls, String toolCallId) {
 
     public Message {
+        if (toolCalls != null) {
+            // Manual loop, not List.copyOf's own null check: List.copyOf's message doesn't
+            // say which component failed, and some List implementations throw on
+            // contains(null) rather than just returning false.
+            for (ToolCall call : toolCalls) {
+                if (call == null) {
+                    throw new IllegalArgumentException("Message.toolCalls must not contain null elements");
+                }
+            }
+        }
         toolCalls = toolCalls == null ? List.of() : List.copyOf(toolCalls);
     }
 
@@ -36,7 +46,15 @@ public record Message(Role role, String content, List<ToolCall> toolCalls, Strin
         return new Message(Role.ASSISTANT, content, toolCalls, null);
     }
 
+    /**
+     * {@code content} is normalized to {@code ""} when {@code null}: unlike an
+     * {@code ASSISTANT} message (whose {@code content} may legitimately be
+     * {@code null} for a tool-call-only turn), providers such as OpenAI
+     * require a {@code content} field — even an empty one — on every
+     * {@code tool} message, and a {@code null} here would otherwise surface
+     * as a remote 400 instead of a clear local one.
+     */
     public static Message toolResult(String toolCallId, String content) {
-        return new Message(Role.TOOL, content, List.of(), toolCallId);
+        return new Message(Role.TOOL, content == null ? "" : content, List.of(), toolCallId);
     }
 }

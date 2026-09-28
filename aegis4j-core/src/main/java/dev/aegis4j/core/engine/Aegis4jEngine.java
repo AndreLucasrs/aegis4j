@@ -103,7 +103,10 @@ public final class Aegis4jEngine {
             response = runToolLoop(provider, route, request, messages, response);
         }
 
-        String sanitizedOutput = guardChain.runOutput(ctx, response.content());
+        // response.content() can legitimately be null after a tool-call-only
+        // turn (see the OpenAI wire format): guards operate on text, not on
+        // the absence of it, so an empty string goes through instead of null.
+        String sanitizedOutput = guardChain.runOutput(ctx, response.content() == null ? "" : response.content());
 
         return new CompletionResponse(
                 response.id(),
@@ -121,16 +124,22 @@ public final class Aegis4jEngine {
      * Each iteration appends the model's tool-call request and every tool's
      * result to the conversation and calls the provider again; the loop ends
      * as soon as a response comes back with no pending tool calls.
+     *
+     * <p>{@code providerCalls} starts at 1 because {@code response} is
+     * already the result of one {@code provider.complete()} call made before
+     * this method was entered — {@link #maxToolIterations} is a cap on the
+     * total number of provider calls per {@link #chat}, not on how many
+     * extra round trips this loop itself makes, so a default of 5 means at
+     * most 5 calls to the provider altogether, not 6.
      */
     private CompletionResponse runToolLoop(
             Provider provider, ResolvedRoute route, ChatRequest request, List<Message> messages, CompletionResponse response
     ) {
         List<Message> conversation = new ArrayList<>(messages);
-        int iteration = 0;
+        int providerCalls = 1;
 
         while (!response.toolCalls().isEmpty()) {
-            iteration++;
-            if (iteration > maxToolIterations) {
+            if (providerCalls >= maxToolIterations) {
                 throw new ToolCallLimitExceededException(maxToolIterations);
             }
 
@@ -147,6 +156,7 @@ public final class Aegis4jEngine {
                     .tools(toolDefinitions)
                     .build();
             response = provider.complete(followUp);
+            providerCalls++;
         }
 
         return response;
@@ -158,12 +168,14 @@ public final class Aegis4jEngine {
      * or explain the failure, the same way {@code McpClient.callTool} reports
      * a tool error in-band rather than throwing. The iteration cap above is
      * the actual safety net against a model that never stops calling tools.
+     * Only the exception's class name reaches the model, never
+     * {@code e.getMessage()} — see {@link ToolExecutor} for why.
      */
     private String executeTool(ToolCall call) {
         try {
             return toolExecutor.execute(call);
         } catch (RuntimeException e) {
-            return "Tool \"" + call.name() + "\" failed: " + e.getMessage();
+            return "Tool \"" + call.name() + "\" failed (" + e.getClass().getSimpleName() + ")";
         }
     }
 
@@ -173,6 +185,12 @@ public final class Aegis4jEngine {
      * retrieval, routing and prompt assembly — output guards are NOT applied
      * to streamed chunks. Callers that need guaranteed output guarding must
      * use {@link #chat}.
+     *
+     * <p>Also does not implement tool calling: even when {@link Builder#tools}
+     * is configured, this method never sends {@code tools} on the request
+     * and never inspects the stream for tool calls — that loop only exists
+     * in {@link #chat}. Callers that configure tools and use this method
+     * instead will see the feature silently do nothing.
      */
     public Stream<dev.aegis4j.api.provider.CompletionChunk> chatStream(ChatRequest request) {
         GuardContext ctx = new GuardContext(request.requestId(), request.userId(), Map.of());
@@ -326,9 +344,35 @@ public final class Aegis4jEngine {
          * is always caller-supplied — {@code aegis4j-core} ships no
          * executor of its own, since deciding what is safe to run is the
          * embedder's call, not the library's.
+         *
+         * <p><b>Provider support is partial as of this writing:</b> only
+         * {@code OpenAiCompatibleProvider} actually sends {@code tools} on
+         * the wire and parses {@code tool_calls} back — {@code OllamaProvider}
+         * and {@code AnthropicProvider} silently ignore {@code tools} (no
+         * error, no log) and will never return a tool call, so the loop
+         * this method enables will never trigger against them. Route tool
+         * calling to an {@code OpenAiCompatibleProvider}-backed model until
+         * the other two providers gain equivalent support.
+         *
+         * <p><b>Security:</b> the guard chain only sanitizes the initial
+         * user input and the final answer — see {@link ToolExecutor} for why
+         * intermediate tool results and model reasoning inside the loop are
+         * never guarded.
+         *
+         * @throws IllegalArgumentException if {@code definitions} is
+         *         non-null but {@code executor} is null — that combination
+         *         is indistinguishable from a caller mistake (definitions
+         *         with nothing to run them) rather than "leave tools
+         *         disabled", which is instead {@code executor == null} with
+         *         {@code definitions == null}.
          */
         public Builder tools(List<ToolDefinition> definitions, ToolExecutor executor) {
             if (executor == null) {
+                if (definitions != null) {
+                    throw new IllegalArgumentException(
+                            "Aegis4jEngine.Builder.tools(definitions, executor): executor must not be null "
+                                    + "when tool definitions are provided; pass both null to leave tools disabled");
+                }
                 return this;
             }
             this.toolDefinitions = definitions == null ? List.of() : List.copyOf(definitions);
@@ -336,7 +380,13 @@ public final class Aegis4jEngine {
             return this;
         }
 
-        /** Hard cap on tool-calling round trips per {@code chat()} call; defaults to {@value #DEFAULT_MAX_TOOL_ITERATIONS}. */
+        /**
+         * Hard cap on the total number of {@code provider.complete()} calls
+         * {@link #chat} makes for a single request, including the first one —
+         * defaults to {@value #DEFAULT_MAX_TOOL_ITERATIONS}, so by default
+         * {@code chat()} calls the provider at most 5 times total, not 5
+         * times in addition to the initial call.
+         */
         public Builder maxToolIterations(int maxToolIterations) {
             if (maxToolIterations < 1) {
                 throw new IllegalArgumentException("maxToolIterations must be at least 1, got " + maxToolIterations);

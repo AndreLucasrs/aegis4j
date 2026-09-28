@@ -35,6 +35,13 @@ import java.util.stream.Stream;
  * {@code max_tokens} is required with no default, system prompt is a
  * top-level field rather than a message with role {@code system}, and
  * streaming is a sequence of named SSE events rather than one delta shape.
+ *
+ * <p><b>Does not support tool calling yet:</b> {@link CompletionRequest#tools()}
+ * is silently ignored (never sent as Anthropic's {@code tools} field) and
+ * {@link #complete} always returns an empty {@code toolCalls()} list. Callers
+ * that configure {@code Aegis4jEngine.Builder.tools(...)} against this
+ * provider will never see a tool call trigger the engine's tool-calling
+ * loop, with no error or log to say so.
  */
 public final class AnthropicProvider implements Provider {
 
