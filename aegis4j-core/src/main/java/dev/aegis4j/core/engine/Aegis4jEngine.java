@@ -6,10 +6,12 @@ import dev.aegis4j.api.provider.CompletionResponse;
 import dev.aegis4j.api.provider.CompletionRequest;
 import dev.aegis4j.api.provider.Message;
 import dev.aegis4j.api.provider.Provider;
+import dev.aegis4j.api.provider.Usage;
 import dev.aegis4j.api.rag.RetrievedChunk;
 import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.api.routing.RoutingContext;
+import dev.aegis4j.api.usage.UsageTracker;
 import dev.aegis4j.core.guard.GuardChain;
 import dev.aegis4j.core.observability.EngineListener;
 import dev.aegis4j.core.persona.PersonaManager;
@@ -47,6 +49,7 @@ public final class Aegis4jEngine {
     private final PersonaManager personaManager;
     private final Retriever retriever;
     private final ModelRouter modelRouter;
+    private final UsageTracker usageTracker;
     private final List<EngineListener> listeners;
     private final PromptAssembler promptAssembler = new PromptAssembler();
 
@@ -61,6 +64,7 @@ public final class Aegis4jEngine {
         this.personaManager = builder.personaManager;
         this.retriever = builder.retriever;
         this.modelRouter = builder.modelRouter;
+        this.usageTracker = builder.usageTracker;
         this.listeners = List.copyOf(builder.listeners);
     }
 
@@ -81,6 +85,8 @@ public final class Aegis4jEngine {
             CompletionResponse response = provider.complete(pipeline.completionRequest());
             Duration providerCallDuration = Duration.between(providerCallStart, Instant.now());
             notifyListeners(l -> l.onProviderCallComplete(requestId, response, providerCallDuration));
+
+            recordUsage(pipeline.route(), response);
 
             String sanitizedOutput = guardChain.runOutput(pipeline.guardContext(), response.content());
             notifyListeners(l -> l.onOutputGuardComplete(requestId, sanitizedOutput));
@@ -119,6 +125,12 @@ public final class Aegis4jEngine {
      * duration only covers this synchronous setup — resolving the request
      * into a {@link CompletionRequest} and obtaining the {@link Stream} from
      * the provider — not the caller's later consumption of that stream.
+     *
+     * <p>v1 limitation: {@link dev.aegis4j.api.provider.CompletionChunk}
+     * carries no {@code Usage}, so a configured {@link UsageTracker} is
+     * never called from this method — only {@link #chat} records usage.
+     * Providers would need to surface usage on the terminal chunk before
+     * this method could track streamed calls.
      */
     public Stream<dev.aegis4j.api.provider.CompletionChunk> chatStream(ChatRequest request) {
         String requestId = request.requestId();
@@ -243,6 +255,38 @@ public final class Aegis4jEngine {
         }
     }
 
+    /**
+     * Reports usage to a configured {@link UsageTracker}, if any — a no-op
+     * when none is set. Isolated the same way {@link #notifyListeners} is:
+     * a tracker is typically a side effect (writing to a DB, a billing API,
+     * a metrics system) and must never be able to turn an already-successful
+     * LLM response into a failed {@code chat()} call, so whatever it throws
+     * is caught and logged, never propagated.
+     *
+     * <p>Keys by {@code route.model()} — the model {@code chat()} actually
+     * resolved and requested (explicit on {@link ChatRequest}, or via
+     * {@link ModelRouter}) — rather than {@code response.model()}, since a
+     * provider may echo back a more specific string (e.g. a dated snapshot
+     * alias) than what was asked for; see {@code InMemoryUsageTracker}'s
+     * class Javadoc for why this matters for pricing lookups.
+     *
+     * <p>Falls back to {@link Usage#UNKNOWN} when {@code response.usage()}
+     * is {@code null} — neither {@link Provider} nor {@link CompletionResponse}
+     * guarantee a non-null {@code usage()}, even though every provider
+     * shipped in this repo today always sets one.
+     */
+    private void recordUsage(ResolvedRoute route, CompletionResponse response) {
+        if (usageTracker == null) {
+            return;
+        }
+        Usage usage = response.usage() != null ? response.usage() : Usage.UNKNOWN;
+        try {
+            usageTracker.record(route.providerId(), route.model(), usage);
+        } catch (RuntimeException | Error e) {
+            LOGGER.log(System.Logger.Level.WARNING, "UsageTracker threw an exception; ignoring", e);
+        }
+    }
+
     public static final class Builder {
         private ProviderRegistry providerRegistry = new ProviderRegistry();
         private GuardChain guardChain = GuardChain.of();
@@ -251,6 +295,7 @@ public final class Aegis4jEngine {
         private PersonaManager personaManager = PersonaManager.none();
         private Retriever retriever;
         private ModelRouter modelRouter;
+        private UsageTracker usageTracker;
         private Boolean skillCatalogInSystemPrompt;
         private final List<EngineListener> listeners = new ArrayList<>();
 
@@ -313,6 +358,19 @@ public final class Aegis4jEngine {
         public Builder modelRouter(ModelRouter modelRouter) {
             if (modelRouter != null) {
                 this.modelRouter = modelRouter;
+            }
+            return this;
+        }
+
+        /**
+         * Opts into usage tracking: once set, {@link #chat} reports every
+         * successful completion's {@link dev.aegis4j.api.provider.Usage} to
+         * this tracker. {@code null} is a safe no-op — leaves usage tracking
+         * disabled (or whatever was set before).
+         */
+        public Builder usageTracker(UsageTracker usageTracker) {
+            if (usageTracker != null) {
+                this.usageTracker = usageTracker;
             }
             return this;
         }
