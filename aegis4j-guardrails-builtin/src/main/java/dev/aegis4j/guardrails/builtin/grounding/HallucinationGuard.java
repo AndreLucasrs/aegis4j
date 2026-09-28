@@ -120,6 +120,7 @@ public final class HallucinationGuard extends GuardAdapter {
     private GroundingVerdict judge(List<RetrievedChunk> chunks, String responseText) {
         String context = chunks.stream()
                 .map(RetrievedChunk::content)
+                .map(content -> content == null ? "" : content)
                 .collect(Collectors.joining("\n---\n"));
 
         String judgePrompt = """
@@ -148,7 +149,16 @@ public final class HallucinationGuard extends GuardAdapter {
                 .temperature(0.0)
                 .build();
 
-        CompletionResponse response = judgeProvider.complete(request);
+        CompletionResponse response;
+        try {
+            response = judgeProvider.complete(request);
+        } catch (RuntimeException e) {
+            // Same fail-open philosophy as an unparseable verdict: a judge
+            // call failing (timeout, rate limit, provider error, ...) must
+            // never take down a turn whose primary response already
+            // succeeded, and must never be treated as "ungrounded" either.
+            return new GroundingVerdict(true, 0.0, "judge provider call failed: " + e.getMessage());
+        }
         return parseVerdict(response.content());
     }
 
@@ -169,7 +179,12 @@ public final class HallucinationGuard extends GuardAdapter {
             return new GroundingVerdict(true, 0.0, "unparseable judge response");
         }
 
-        double confidence = extractConfidence(raw).orElse(1.0);
+        // A missing/unparseable CONFIDENCE line is treated the same as
+        // "the judge isn't sure" (low, not high, confidence) — consistent
+        // with the fully-unparseable-response case above, and the opposite
+        // of what a default of 1.0 would do to the confidence-threshold
+        // check in checkOutput().
+        double confidence = extractConfidence(raw).orElse(0.0);
         String reason = extractReason(raw).orElse("");
         return new GroundingVerdict(!ungrounded, confidence, reason);
     }

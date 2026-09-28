@@ -2,6 +2,7 @@ package dev.aegis4j.guardrails.builtin.grounding;
 
 import dev.aegis4j.api.guard.GuardContext;
 import dev.aegis4j.api.guard.GuardResult;
+import dev.aegis4j.api.provider.ProviderTimeoutException;
 import dev.aegis4j.api.rag.RetrievedChunk;
 import dev.aegis4j.testkit.FakeProvider;
 import org.junit.jupiter.api.Test;
@@ -98,6 +99,46 @@ class HallucinationGuardTest {
         GuardResult result = guard.checkOutput(ctxWithChunks(CONTEXT_CHUNKS), "Paris has 40 million people.");
 
         assertThat(result).isInstanceOf(GuardResult.Pass.class);
+    }
+
+    @Test
+    void judgeProviderFailureFailsOpenInsteadOfPropagating() {
+        FakeProvider judge = FakeProvider.withId("judge").respondingWith(request -> {
+            throw new ProviderTimeoutException("judge", "timed out", null);
+        });
+        HallucinationGuard guard = HallucinationGuard.strict(judge, "judge-model");
+
+        GuardResult result = guard.checkOutput(ctxWithChunks(CONTEXT_CHUNKS), "Paris has 40 million people.");
+
+        assertThat(result).isInstanceOf(GuardResult.Pass.class);
+    }
+
+    @Test
+    void missingConfidenceLineDefaultsToLowConfidenceNotHigh() {
+        // Real judges sometimes drift from the requested "CONFIDENCE:" format
+        // (e.g. "Confidence level: 0.9"); a default of 1.0 here would defeat
+        // the whole point of the confidence threshold.
+        FakeProvider judge = FakeProvider.withId("judge")
+                .respondingWith("VERDICT: UNGROUNDED\nConfidence level: 0.9\nREASON: invents facts");
+        HallucinationGuard guard = HallucinationGuard.strict(judge, "judge-model");
+
+        GuardResult result = guard.checkOutput(ctxWithChunks(CONTEXT_CHUNKS), "Paris has 40 million people.");
+
+        assertThat(result).isInstanceOf(GuardResult.Pass.class);
+    }
+
+    @Test
+    void nullChunkContentDoesNotThrow() {
+        List<RetrievedChunk> chunksWithNullContent =
+                List.of(new RetrievedChunk(null, "doc-1", 0.9, Map.of()));
+        FakeProvider judge = FakeProvider.withId("judge")
+                .respondingWith("VERDICT: GROUNDED\nCONFIDENCE: 1.0\nREASON: n/a");
+        HallucinationGuard guard = new HallucinationGuard(judge, "judge-model");
+
+        GuardResult result = guard.checkOutput(ctxWithChunks(chunksWithNullContent), "some response");
+
+        assertThat(result).isInstanceOf(GuardResult.Pass.class);
+        assertThat(judge.receivedRequests()).hasSize(1);
     }
 
     @Test
