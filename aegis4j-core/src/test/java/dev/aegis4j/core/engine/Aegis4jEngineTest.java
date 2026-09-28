@@ -194,6 +194,44 @@ class Aegis4jEngineTest {
     }
 
     @Test
+    void outputGuardsSeeRetrievedChunksViaGuardContext() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        FakeRetriever retriever = FakeRetriever.withChunks(
+                List.of(new RetrievedChunk("relevant fact", "doc-1", 0.9, Map.of()))
+        );
+        List<RetrievedChunk> seenByGuard = new java.util.ArrayList<>();
+        Guard capturingGuard = new Guard() {
+            @Override
+            public String id() {
+                return "capture-chunks";
+            }
+
+            @Override
+            public GuardResult checkInput(GuardContext ctx, String text) {
+                // Input guards run before retrieval, so no chunks are available yet.
+                assertThat(ctx.retrievedChunks()).isEmpty();
+                return GuardResult.pass();
+            }
+
+            @Override
+            public GuardResult checkOutput(GuardContext ctx, String text) {
+                seenByGuard.addAll(ctx.retrievedChunks());
+                return GuardResult.pass();
+            }
+        };
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .retriever(retriever)
+                .guardChain(GuardChain.of(capturingGuard))
+                .build();
+
+        engine.chat(ChatRequest.builder().providerId("fake").model("m").userInput("tell me about it").build());
+
+        assertThat(seenByGuard).extracting(RetrievedChunk::content).containsExactly("relevant fact");
+    }
+
+    @Test
     void explicitProviderAndModelWinOverRouting() {
         FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
         ModelRouter router = new ModelRouter(List.of(), new RouteTarget("other-provider", "other-model"));

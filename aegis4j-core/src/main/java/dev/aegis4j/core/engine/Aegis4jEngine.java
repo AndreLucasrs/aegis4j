@@ -160,9 +160,9 @@ public final class Aegis4jEngine {
      * callbacks they fire for this shared portion of the pipeline.
      */
     private Pipeline runPipeline(String requestId, ChatRequest request) {
-        GuardContext ctx = new GuardContext(request.requestId(), request.userId(), Map.of());
+        GuardContext inputCtx = new GuardContext(request.requestId(), request.userId(), Map.of());
 
-        String sanitizedInput = guardChain.runInput(ctx, request.userInput());
+        String sanitizedInput = guardChain.runInput(inputCtx, request.userInput());
         notifyListeners(l -> l.onInputGuardComplete(requestId, sanitizedInput));
 
         List<RetrievedChunk> retrievedChunks = resolveChunks(sanitizedInput, request);
@@ -189,7 +189,15 @@ public final class Aegis4jEngine {
                 .maxTokens(request.maxTokens())
                 .build();
 
-        return new Pipeline(ctx, route, completionRequest);
+        // Output guards (e.g. a grounding/hallucination judge) need the RAG
+        // context, which is only known after the input-guard ctx above was
+        // built — hence a separate GuardContext here rather than reusing
+        // inputCtx. chatStream() never reads Pipeline.guardContext() since it
+        // doesn't run output guards, so this costs nothing on that path.
+        GuardContext outputCtx = new GuardContext(request.requestId(), request.userId(),
+                Map.of(GuardContext.RETRIEVED_CHUNKS_KEY, retrievedChunks));
+
+        return new Pipeline(outputCtx, route, completionRequest);
     }
 
     private record Pipeline(GuardContext guardContext, ResolvedRoute route, CompletionRequest completionRequest) {

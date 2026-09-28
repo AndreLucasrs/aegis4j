@@ -12,5 +12,6 @@ dependencies {
 
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.assertj.core)
+    testImplementation(project(":aegis4j-testkit"))
     testRuntimeOnly(libs.junit.platform.launcher)
 }
