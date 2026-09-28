@@ -61,6 +61,24 @@ class InMemoryUsageTrackerTest {
     }
 
     @Test
+    void snapshotSaturatesAtIntegerMaxValueInsteadOfOverflowingSilently() {
+        InMemoryUsageTracker tracker = new InMemoryUsageTracker();
+
+        tracker.record("openai", "gpt-4o", new Usage(Integer.MAX_VALUE, 0, Integer.MAX_VALUE));
+        tracker.record("openai", "gpt-4o", new Usage(1, 0, 1));
+
+        Usage snapshotUsage = tracker.snapshot().get(new InMemoryUsageTracker.UsageKey("openai", "gpt-4o"));
+
+        // A naive (int) cast of the underlying long sum would wrap around to a
+        // negative number here; saturation keeps it clamped at MAX_VALUE instead.
+        assertThat(snapshotUsage.promptTokens()).isEqualTo(Integer.MAX_VALUE);
+        assertThat(snapshotUsage.totalTokens()).isEqualTo(Integer.MAX_VALUE);
+
+        // The long-typed accessor is unaffected by the int-facing saturation.
+        assertThat(tracker.promptTokens("openai", "gpt-4o")).isEqualTo((long) Integer.MAX_VALUE + 1L);
+    }
+
+    @Test
     void estimatesCostFromConfiguredPricing() {
         InMemoryUsageTracker tracker = new InMemoryUsageTracker(
                 Map.of("gpt-4o", new InMemoryUsageTracker.PricingRate(0.005, 0.015))

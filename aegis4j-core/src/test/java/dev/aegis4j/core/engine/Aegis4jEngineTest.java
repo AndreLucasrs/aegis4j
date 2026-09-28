@@ -280,14 +280,73 @@ class Aegis4jEngineTest {
                 .isEqualTo("ok");
     }
 
+    @Test
+    void recordsUsageUnderTheRequestedModelNotWhateverTheProviderEchoesBack() {
+        // Simulates a provider that resolves a caller-facing alias ("gpt-4o") to a
+        // dated snapshot ("gpt-4o-2024-08-06") in its response, as OpenAI does.
+        Provider provider = new UsageReportingProvider("fake", new Usage(1, 1, 2), "gpt-4o-2024-08-06");
+        List<String> recordedModels = new ArrayList<>();
+        UsageTracker tracker = (providerId, model, usage) -> recordedModels.add(model);
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .usageTracker(tracker)
+                .build();
+
+        engine.chat(ChatRequest.builder().providerId("fake").model("gpt-4o").userInput("hi").build());
+
+        assertThat(recordedModels).containsExactly("gpt-4o");
+    }
+
+    @Test
+    void treatsNullUsageFromProviderAsUnknownInsteadOfFailing() {
+        Provider provider = new UsageReportingProvider("fake", null);
+        List<Usage> recorded = new ArrayList<>();
+        UsageTracker tracker = (providerId, model, usage) -> recorded.add(usage);
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .usageTracker(tracker)
+                .build();
+
+        var response = engine.chat(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build());
+
+        assertThat(response.content()).isEqualTo("ok");
+        assertThat(recorded).containsExactly(Usage.UNKNOWN);
+    }
+
+    @Test
+    void usageTrackerFailureDoesNotFailChat() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        UsageTracker failingTracker = (providerId, model, usage) -> {
+            throw new RuntimeException("billing API is down");
+        };
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .usageTracker(failingTracker)
+                .build();
+
+        var response = engine.chat(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build());
+
+        assertThat(response.content()).isEqualTo("ok");
+    }
+
     /** Minimal {@link Provider} double that returns a caller-supplied {@link Usage} instead of {@link Usage#UNKNOWN}. */
     private static final class UsageReportingProvider implements Provider {
         private final String id;
         private final Usage usage;
+        private final String responseModelOverride;
 
         UsageReportingProvider(String id, Usage usage) {
+            this(id, usage, null);
+        }
+
+        /** {@code responseModelOverride}, when non-null, simulates a provider echoing back a different model string than what was requested. */
+        UsageReportingProvider(String id, Usage usage, String responseModelOverride) {
             this.id = id;
             this.usage = usage;
+            this.responseModelOverride = responseModelOverride;
         }
 
         @Override
@@ -297,7 +356,8 @@ class Aegis4jEngineTest {
 
         @Override
         public CompletionResponse complete(CompletionRequest request) {
-            return new CompletionResponse("resp-1", request.model(), "ok", FinishReason.STOP, usage, List.of());
+            String model = responseModelOverride != null ? responseModelOverride : request.model();
+            return new CompletionResponse("resp-1", model, "ok", FinishReason.STOP, usage, List.of());
         }
 
         @Override
