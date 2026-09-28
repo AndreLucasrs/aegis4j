@@ -29,6 +29,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -158,6 +159,73 @@ class Aegis4jServerE2ETest {
             wireMock.verify(postRequestedFor(urlEqualTo("/api/chat")).withRequestBody(containing("qwen2.5-coder:7b")));
         } finally {
             routedApp.stop();
+        }
+    }
+
+    @Test
+    void streamsSseChunksAndTerminatesWithDoneWhenStreamTrue() throws Exception {
+        WireMockServer streamingWireMock = new WireMockServer(options().dynamicPort());
+        streamingWireMock.start();
+        streamingWireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"model":"llama3","message":{"role":"assistant","content":"hel"},"done":false}
+                        {"model":"llama3","message":{"role":"assistant","content":"lo"},"done":false}
+                        {"model":"llama3","message":{"role":"assistant","content":""},"done":true}
+                        """)));
+
+        OllamaProvider ollama = new OllamaProvider(
+                "http://localhost:" + streamingWireMock.port(), HttpClient.newHttpClient(), Duration.ofSeconds(5)
+        );
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(ollama);
+
+        Aegis4jEngine streamingEngine = Aegis4jEngine.builder()
+                .providerRegistry(providerRegistry)
+                .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000)))
+                .build();
+
+        Javalin streamingApp = Aegis4jServerApp.createApp(streamingEngine, OllamaProvider.ID);
+        streamingApp.start(0);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + streamingApp.port() + "/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""
+                            {"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}
+                            """))
+                    .build();
+            HttpResponse<Stream<String>> response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.headers().firstValue("content-type")).hasValueSatisfying(
+                    contentType -> assertThat(contentType).startsWith("text/event-stream"));
+
+            List<String> dataLines;
+            try (Stream<String> lines = response.body()) {
+                dataLines = lines.filter(line -> line.startsWith("data: ")).map(line -> line.substring("data: ".length())).toList();
+            }
+
+            assertThat(dataLines).hasSize(4);
+            assertThat(dataLines.get(3)).isEqualTo("[DONE]");
+
+            JsonNode first = mapper.readTree(dataLines.get(0));
+            assertThat(first.at("/object").asText()).isEqualTo("chat.completion.chunk");
+            assertThat(first.at("/choices/0/delta/role").asText()).isEqualTo("assistant");
+            assertThat(first.at("/choices/0/delta/content").asText()).isEqualTo("hel");
+            assertThat(first.at("/choices/0/finish_reason").isNull()).isTrue();
+
+            JsonNode second = mapper.readTree(dataLines.get(1));
+            assertThat(second.at("/choices/0/delta/role").isMissingNode()).isTrue();
+            assertThat(second.at("/choices/0/delta/content").asText()).isEqualTo("lo");
+
+            JsonNode last = mapper.readTree(dataLines.get(2));
+            assertThat(last.at("/choices/0/delta/content").isMissingNode()).isTrue();
+            assertThat(last.at("/choices/0/finish_reason").asText()).isEqualTo("stop");
+        } finally {
+            streamingApp.stop();
+            streamingWireMock.stop();
         }
     }
 
