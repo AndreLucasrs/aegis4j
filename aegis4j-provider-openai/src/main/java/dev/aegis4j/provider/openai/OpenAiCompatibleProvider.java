@@ -189,11 +189,19 @@ public final class OpenAiCompatibleProvider implements Provider {
         return OpenAiTool.function(new OpenAiFunctionDef(definition.name(), definition.description(), definition.parametersSchema()));
     }
 
+    /**
+     * Guards against a {@code null} element in a malformed backend's
+     * {@code tool_calls} array — {@code .map()} would otherwise NPE deep
+     * inside the stream on the first {@code call.id()}/{@code call.function()}
+     * access, which is a much less useful failure than simply dropping the
+     * malformed entry.
+     */
     private List<ToolCall> toToolCalls(OpenAiMessage message) {
         if (message.toolCalls() == null || message.toolCalls().isEmpty()) {
             return List.of();
         }
         return message.toolCalls().stream()
+                .filter(call -> call != null && call.function() != null)
                 .map(call -> new ToolCall(call.id(), call.function().name(), call.function().arguments()))
                 .toList();
     }
