@@ -6,6 +6,9 @@ import dev.aegis4j.api.provider.CompletionResponse;
 import dev.aegis4j.api.provider.CompletionRequest;
 import dev.aegis4j.api.provider.Message;
 import dev.aegis4j.api.provider.Provider;
+import dev.aegis4j.api.provider.ToolCall;
+import dev.aegis4j.api.provider.ToolDefinition;
+import dev.aegis4j.api.provider.ToolExecutor;
 import dev.aegis4j.api.rag.RetrievedChunk;
 import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.api.routing.RouteTarget;
@@ -19,6 +22,7 @@ import dev.aegis4j.core.skill.KeywordSkillActivationStrategy;
 import dev.aegis4j.core.skill.SkillActivationStrategy;
 import dev.aegis4j.core.skill.SkillRegistry;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -32,6 +36,7 @@ import java.util.stream.Stream;
 public final class Aegis4jEngine {
 
     private static final int DEFAULT_TOP_K = 4;
+    static final int DEFAULT_MAX_TOOL_ITERATIONS = 5;
 
     private final ProviderRegistry providerRegistry;
     private final GuardChain guardChain;
@@ -41,6 +46,9 @@ public final class Aegis4jEngine {
     private final PersonaManager personaManager;
     private final Retriever retriever;
     private final ModelRouter modelRouter;
+    private final List<ToolDefinition> toolDefinitions;
+    private final ToolExecutor toolExecutor;
+    private final int maxToolIterations;
     private final PromptAssembler promptAssembler = new PromptAssembler();
 
     private Aegis4jEngine(Builder builder) {
@@ -54,6 +62,9 @@ public final class Aegis4jEngine {
         this.personaManager = builder.personaManager;
         this.retriever = builder.retriever;
         this.modelRouter = builder.modelRouter;
+        this.toolDefinitions = builder.toolDefinitions;
+        this.toolExecutor = builder.toolExecutor;
+        this.maxToolIterations = builder.maxToolIterations;
     }
 
     public static Builder builder() {
@@ -83,9 +94,14 @@ public final class Aegis4jEngine {
                 .messages(messages)
                 .temperature(request.temperature())
                 .maxTokens(request.maxTokens())
+                .tools(toolDefinitions)
                 .build();
 
         CompletionResponse response = provider.complete(completionRequest);
+
+        if (toolExecutor != null) {
+            response = runToolLoop(provider, route, request, messages, response);
+        }
 
         String sanitizedOutput = guardChain.runOutput(ctx, response.content());
 
@@ -97,6 +113,58 @@ public final class Aegis4jEngine {
                 response.usage(),
                 response.toolCalls()
         );
+    }
+
+    /**
+     * Only entered when a {@link ToolExecutor} is configured, so callers that
+     * never opt in keep getting exactly the old single-round-trip behavior.
+     * Each iteration appends the model's tool-call request and every tool's
+     * result to the conversation and calls the provider again; the loop ends
+     * as soon as a response comes back with no pending tool calls.
+     */
+    private CompletionResponse runToolLoop(
+            Provider provider, ResolvedRoute route, ChatRequest request, List<Message> messages, CompletionResponse response
+    ) {
+        List<Message> conversation = new ArrayList<>(messages);
+        int iteration = 0;
+
+        while (!response.toolCalls().isEmpty()) {
+            iteration++;
+            if (iteration > maxToolIterations) {
+                throw new ToolCallLimitExceededException(maxToolIterations);
+            }
+
+            conversation.add(Message.assistantToolCall(response.content(), response.toolCalls()));
+            for (ToolCall call : response.toolCalls()) {
+                conversation.add(Message.toolResult(call.id(), executeTool(call)));
+            }
+
+            CompletionRequest followUp = CompletionRequest.builder()
+                    .model(route.model())
+                    .messages(conversation)
+                    .temperature(request.temperature())
+                    .maxTokens(request.maxTokens())
+                    .tools(toolDefinitions)
+                    .build();
+            response = provider.complete(followUp);
+        }
+
+        return response;
+    }
+
+    /**
+     * A failing tool is fed back to the model as its result instead of
+     * aborting the whole exchange — the model can then retry, work around it
+     * or explain the failure, the same way {@code McpClient.callTool} reports
+     * a tool error in-band rather than throwing. The iteration cap above is
+     * the actual safety net against a model that never stops calling tools.
+     */
+    private String executeTool(ToolCall call) {
+        try {
+            return toolExecutor.execute(call);
+        } catch (RuntimeException e) {
+            return "Tool \"" + call.name() + "\" failed: " + e.getMessage();
+        }
     }
 
     /**
@@ -182,6 +250,9 @@ public final class Aegis4jEngine {
         private Retriever retriever;
         private ModelRouter modelRouter;
         private Boolean skillCatalogInSystemPrompt;
+        private List<ToolDefinition> toolDefinitions = List.of();
+        private ToolExecutor toolExecutor;
+        private int maxToolIterations = DEFAULT_MAX_TOOL_ITERATIONS;
 
         public Builder providerRegistry(ProviderRegistry providerRegistry) {
             this.providerRegistry = providerRegistry;
@@ -243,6 +314,34 @@ public final class Aegis4jEngine {
             if (modelRouter != null) {
                 this.modelRouter = modelRouter;
             }
+            return this;
+        }
+
+        /**
+         * Opts into the tool-calling loop: off by default (a fresh
+         * {@code Builder} sends no {@code tools} to the provider and never
+         * inspects {@code response.toolCalls()}) so existing consumers such
+         * as Janus, which embed {@code Aegis4jEngine} directly, keep their
+         * current behavior unless they call this explicitly. {@code executor}
+         * is always caller-supplied — {@code aegis4j-core} ships no
+         * executor of its own, since deciding what is safe to run is the
+         * embedder's call, not the library's.
+         */
+        public Builder tools(List<ToolDefinition> definitions, ToolExecutor executor) {
+            if (executor == null) {
+                return this;
+            }
+            this.toolDefinitions = definitions == null ? List.of() : List.copyOf(definitions);
+            this.toolExecutor = executor;
+            return this;
+        }
+
+        /** Hard cap on tool-calling round trips per {@code chat()} call; defaults to {@value #DEFAULT_MAX_TOOL_ITERATIONS}. */
+        public Builder maxToolIterations(int maxToolIterations) {
+            if (maxToolIterations < 1) {
+                throw new IllegalArgumentException("maxToolIterations must be at least 1, got " + maxToolIterations);
+            }
+            this.maxToolIterations = maxToolIterations;
             return this;
         }
 
