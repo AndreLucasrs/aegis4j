@@ -199,6 +199,44 @@ class Aegis4jEngineTest {
     }
 
     @Test
+    void outputGuardsSeeRetrievedChunksViaGuardContext() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        FakeRetriever retriever = FakeRetriever.withChunks(
+                List.of(new RetrievedChunk("relevant fact", "doc-1", 0.9, Map.of()))
+        );
+        List<RetrievedChunk> seenByGuard = new ArrayList<>();
+        Guard capturingGuard = new Guard() {
+            @Override
+            public String id() {
+                return "capture-chunks";
+            }
+
+            @Override
+            public GuardResult checkInput(GuardContext ctx, String text) {
+                // Input guards run before retrieval, so no chunks are available yet.
+                assertThat(ctx.retrievedChunks()).isEmpty();
+                return GuardResult.pass();
+            }
+
+            @Override
+            public GuardResult checkOutput(GuardContext ctx, String text) {
+                seenByGuard.addAll(ctx.retrievedChunks());
+                return GuardResult.pass();
+            }
+        };
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .retriever(retriever)
+                .guardChain(GuardChain.of(capturingGuard))
+                .build();
+
+        engine.chat(ChatRequest.builder().providerId("fake").model("m").userInput("tell me about it").build());
+
+        assertThat(seenByGuard).extracting(RetrievedChunk::content).containsExactly("relevant fact");
+    }
+
+    @Test
     void explicitProviderAndModelWinOverRouting() {
         FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
         ModelRouter router = new ModelRouter(List.of(), new RouteTarget("other-provider", "other-model"));
@@ -253,6 +291,25 @@ class Aegis4jEngineTest {
 
         assertThat(response.toolCalls()).containsExactly(call);
         assertThat(provider.receivedRequests()).hasSize(1);
+        assertThat(provider.lastRequest().tools()).isEmpty();
+    }
+
+    @Test
+    void chatStreamNeverSendsToolsEvenWhenConfigured() {
+        // Regression test for the tool-calling-loop / observability merge: runPipeline()
+        // must NOT include tools on the CompletionRequest chatStream() builds, or its own
+        // javadoc's promise ("this method never sends tools on the request") becomes false.
+        ToolDefinition weatherTool = new ToolDefinition("get_weather", "Looks up the weather", Map.of());
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .tools(List.of(weatherTool), toolCall -> "result")
+                .build();
+
+        engine.chatStream(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build())
+                .chunks().toList();
+
         assertThat(provider.lastRequest().tools()).isEmpty();
     }
 
@@ -428,6 +485,22 @@ class Aegis4jEngineTest {
     }
 
     @Test
+    void toolsNullNullActuallyDisablesTheToolsConfiguredByAnEarlierCallOnTheSameBuilder() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        ToolDefinition tool = new ToolDefinition("some_tool", "does something", Map.of());
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .tools(List.of(tool), toolCall -> "result")
+                .tools(null, null)
+                .build();
+
+        engine.chat(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build());
+
+        assertThat(provider.lastRequest().tools()).isEmpty();
+    }
+
+    @Test
     void reportsUsageToConfiguredTrackerAfterChat() {
         Provider provider = new UsageReportingProvider("fake", new Usage(12, 34, 46));
         List<Usage> recorded = new ArrayList<>();
@@ -505,6 +578,38 @@ class Aegis4jEngineTest {
 
         assertThat(response.content()).isEqualTo("ok");
         assertThat(recorded).containsExactly(Usage.UNKNOWN);
+    }
+
+    @Test
+    void chatSumsUsageAcrossEveryRoundOfAMultiIterationToolCallingLoop() {
+        ToolDefinition tool = new ToolDefinition("get_weather", "Looks up the weather", Map.of());
+        AtomicInteger round = new AtomicInteger();
+
+        FakeProvider provider = FakeProvider.withId("fake").respondingWithFullResponse(request -> switch (round.incrementAndGet()) {
+            case 1 -> new CompletionResponse("id-1", request.model(), null, FinishReason.TOOL_CALLS,
+                    new Usage(10, 5, 15), List.of(new ToolCall("call-1", "get_weather", "{}")));
+            case 2 -> new CompletionResponse("id-2", request.model(), null, FinishReason.TOOL_CALLS,
+                    new Usage(20, 8, 28), List.of(new ToolCall("call-2", "get_weather", "{}")));
+            default -> new CompletionResponse("id-3", request.model(), "done", FinishReason.STOP,
+                    new Usage(30, 12, 42), List.of());
+        });
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .tools(List.of(tool), toolCall -> "result")
+                .maxToolIterations(5)
+                .build();
+
+        CompletionResponse response = engine.chat(ChatRequest.builder()
+                .providerId("fake").model("m").userInput("what's the weather").build());
+
+        assertThat(response.content()).isEqualTo("done");
+        assertThat(provider.receivedRequests()).hasSize(3);
+        // Caller-visible usage() must be the SUM of all 3 rounds (10+20+30, 5+8+12,
+        // 15+28+42), not just the last round's (30, 12, 42) — a caller inspecting
+        // response.usage() after a multi-round tool exchange must see the true total
+        // cost, matching what UsageTracker.record() is separately given per round.
+        assertThat(response.usage()).isEqualTo(new Usage(60, 25, 85));
     }
 
     @Test

@@ -88,14 +88,17 @@ public final class Aegis4jEngine {
         try {
             notifyListeners(l -> l.onChatStarted(requestId));
 
-            Pipeline pipeline = runPipeline(requestId, request);
+            Pipeline pipeline = runPipeline(requestId, request, true);
 
             Provider provider = providerRegistry.resolve(pipeline.route().providerId());
             CompletionResponse response = callProvider(provider, pipeline.route(), requestId, pipeline.completionRequest());
+            Usage accumulatedUsage = response.usage() != null ? response.usage() : Usage.UNKNOWN;
 
             if (toolExecutor != null) {
-                response = runToolLoop(
+                ToolLoopResult loopResult = runToolLoop(
                         provider, pipeline.route(), requestId, request, pipeline.completionRequest().messages(), response);
+                response = loopResult.response();
+                accumulatedUsage = sumUsage(accumulatedUsage, loopResult.usage());
             }
 
             // response.content() can legitimately be null after a tool-call-only
@@ -110,7 +113,7 @@ public final class Aegis4jEngine {
                     response.model(),
                     sanitizedOutput,
                     response.finishReason(),
-                    response.usage(),
+                    accumulatedUsage,
                     response.toolCalls()
             );
             notifyListeners(l -> l.onChatComplete(requestId, Duration.between(chatStart, Instant.now())));
@@ -154,13 +157,21 @@ public final class Aegis4jEngine {
      * total number of provider calls per {@link #chat}, not on how many
      * extra round trips this loop itself makes, so a default of 5 means at
      * most 5 calls to the provider altogether, not 6.
+     *
+     * <p>Returns the accumulated {@link Usage} across every follow-up
+     * {@code provider.complete()} call this loop makes (i.e. every round
+     * except the one {@code response} already reflects on entry), so {@link
+     * #chat} can add it to the first round's usage and report the true
+     * total for the whole exchange instead of only the final round's — see
+     * {@link #sumUsage}.
      */
-    private CompletionResponse runToolLoop(
+    private ToolLoopResult runToolLoop(
             Provider provider, ResolvedRoute route, String requestId, ChatRequest request,
             List<Message> messages, CompletionResponse response
     ) {
         List<Message> conversation = new ArrayList<>(messages);
         int providerCalls = 1;
+        Usage loopUsage = Usage.UNKNOWN;
 
         while (!response.toolCalls().isEmpty()) {
             if (providerCalls >= maxToolIterations) {
@@ -180,10 +191,24 @@ public final class Aegis4jEngine {
                     .tools(toolDefinitions)
                     .build();
             response = callProvider(provider, route, requestId, followUp);
+            loopUsage = sumUsage(loopUsage, response.usage() != null ? response.usage() : Usage.UNKNOWN);
             providerCalls++;
         }
 
-        return response;
+        return new ToolLoopResult(response, loopUsage);
+    }
+
+    /** Pairs the tool loop's final {@link CompletionResponse} with the {@link Usage} accumulated across its own follow-up calls; see {@link #runToolLoop}. */
+    private record ToolLoopResult(CompletionResponse response, Usage usage) {
+    }
+
+    /** Field-wise sum, used to combine per-round {@link Usage} into a whole-exchange total for {@link #chat}. */
+    private static Usage sumUsage(Usage a, Usage b) {
+        return new Usage(
+                a.promptTokens() + b.promptTokens(),
+                a.completionTokens() + b.completionTokens(),
+                a.totalTokens() + b.totalTokens()
+        );
     }
 
     /**
@@ -193,12 +218,16 @@ public final class Aegis4jEngine {
      * a tool error in-band rather than throwing. The iteration cap above is
      * the actual safety net against a model that never stops calling tools.
      * Only the exception's class name reaches the model, never
-     * {@code e.getMessage()} — see {@link ToolExecutor} for why.
+     * {@code e.getMessage()} — see {@link ToolExecutor} for why. Catches
+     * {@link Error} as well as {@link RuntimeException} — same reasoning as
+     * {@link #notifyListeners} and {@link #recordUsage}: a single misbehaving
+     * tool (e.g. throwing {@link StackOverflowError}) must not be able to
+     * abort the whole tool-calling exchange.
      */
     private String executeTool(ToolCall call) {
         try {
             return toolExecutor.execute(call);
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | Error e) {
             return "Tool \"" + call.name() + "\" failed (" + e.getClass().getSimpleName() + ")";
         }
     }
@@ -253,7 +282,7 @@ public final class Aegis4jEngine {
         try {
             notifyListeners(l -> l.onChatStarted(requestId));
 
-            Pipeline pipeline = runPipeline(requestId, request);
+            Pipeline pipeline = runPipeline(requestId, request, false);
 
             Provider provider = providerRegistry.resolve(pipeline.route().providerId());
             Stream<dev.aegis4j.api.provider.CompletionChunk> chunks = provider.stream(pipeline.completionRequest());
@@ -273,8 +302,16 @@ public final class Aegis4jEngine {
      * {@link EngineListener} callback after each phase. Kept as a single
      * method specifically so the two callers can't drift apart on which
      * callbacks they fire for this shared portion of the pipeline.
+     *
+     * <p>{@code includeTools} controls whether the assembled
+     * {@link CompletionRequest} carries {@code tools} at all: {@link #chat}
+     * passes {@code true} since it drives the tool-calling loop, while
+     * {@link #chatStream} passes {@code false} to keep its own javadoc's
+     * promise true — it never sends {@code tools} to the provider and never
+     * inspects the stream for tool calls, even when {@link Builder#tools} is
+     * configured.
      */
-    private Pipeline runPipeline(String requestId, ChatRequest request) {
+    private Pipeline runPipeline(String requestId, ChatRequest request, boolean includeTools) {
         GuardContext inputCtx = new GuardContext(request.requestId(), request.userId(), Map.of());
 
         String sanitizedInput = guardChain.runInput(inputCtx, request.userInput());
@@ -302,7 +339,7 @@ public final class Aegis4jEngine {
                 .messages(messages)
                 .temperature(request.temperature())
                 .maxTokens(request.maxTokens())
-                .tools(toolDefinitions)
+                .tools(includeTools ? toolDefinitions : List.of())
                 .build();
 
         // Output guards (e.g. a grounding/hallucination judge) need the RAG
@@ -540,6 +577,13 @@ public final class Aegis4jEngine {
                             "Aegis4jEngine.Builder.tools(definitions, executor): executor must not be null "
                                     + "when tool definitions are provided; pass both null to leave tools disabled");
                 }
+                // Both null: actually disable tools, undoing any earlier
+                // tools(...) call on this same reused Builder — not just a
+                // no-op, since the javadoc above describes this as "the way"
+                // to disable tools, implying it works even after tools were
+                // previously configured.
+                this.toolDefinitions = List.of();
+                this.toolExecutor = null;
                 return this;
             }
             this.toolDefinitions = definitions == null ? List.of() : List.copyOf(definitions);
