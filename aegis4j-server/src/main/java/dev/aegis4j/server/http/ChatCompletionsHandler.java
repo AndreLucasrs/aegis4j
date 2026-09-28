@@ -53,6 +53,19 @@ import java.util.stream.Stream;
  * exhaust that pool. Fixing this properly means moving to async I/O
  * ({@code ctx.future()} plus a dedicated executor), which is a bigger change
  * than this handler takes on today.
+ *
+ * <p><b>Known limitation — no tool-calling round-trip over HTTP:</b>
+ * {@link ChatMessageDto} carries only {@code role}/{@code content}, with no
+ * {@code toolCalls} (on an assistant message) or {@code toolCallId} (on a
+ * tool-result message). So even though {@link Aegis4jEngine} itself supports
+ * tool calling end to end (see {@code Aegis4jEngine.Builder#tools}), this
+ * handler can neither accept a client-supplied tool result on the request
+ * nor echo {@code response.toolCalls()} back on the DTO — {@link #toDto}
+ * only ever sets {@code content}. This is low priority today because no
+ * {@code aegis4j-server} wiring calls {@code .tools(...)} on the engine it
+ * builds, so no deployed server actually drives the tool-calling loop yet;
+ * adding the DTO fields and the request/response mapping is the follow-up
+ * once one does.
  */
 public final class ChatCompletionsHandler implements Handler {
 
@@ -103,7 +116,11 @@ public final class ChatCompletionsHandler implements Handler {
             // routing misconfigured, unknown provider, the provider itself
             // failing, or the tool-calling loop giving up) mapped through the
             // same {@link #mapError} lookup handleStreaming() uses for its
-            // pre-stream errors, so the two paths can't drift apart on status/code.
+            // pre-stream errors, so the two paths can't drift apart on
+            // status/code. Before this, everything but GuardBlockedException/
+            // ToolCallLimitExceededException escaped here as an unhandled 500
+            // from Javalin's default error handler instead of the structured
+            // JSON error shape every other failure on this endpoint gets.
             ErrorMapping mapping = mapError(e);
             writeJsonError(ctx, mapping.httpStatus(), mapping.code(), e.getMessage());
         }

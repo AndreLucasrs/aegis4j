@@ -155,6 +155,23 @@ class OpenAiCompatibleProviderTest {
     }
 
     @Test
+    void toleratesNullElementInMalformedToolCallsArray() {
+        wireMock.stubFor(post(urlEqualTo("/chat/completions")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"id":"chatcmpl-1","model":"gpt-x","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[null,{"id":"call-1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+                        """)));
+
+        CompletionResponse response = provider.complete(CompletionRequest.builder()
+                .model("gpt-x")
+                .messages(List.of(Message.user("what's the weather")))
+                .build());
+
+        assertThat(response.toolCalls()).containsExactly(new ToolCall("call-1", "get_weather", "{}"));
+    }
+
+    @Test
     void mapsUnauthorizedStatusToProviderAuthException() {
         wireMock.stubFor(post(urlEqualTo("/chat/completions")).willReturn(aResponse()
                 .withStatus(401)

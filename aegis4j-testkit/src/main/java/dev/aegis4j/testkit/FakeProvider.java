@@ -77,9 +77,23 @@ public final class FakeProvider implements Provider {
         );
     }
 
+    /**
+     * Mirrors {@link #complete(CompletionRequest)}: honors {@link #respondingWithFullResponse}
+     * when set, instead of always falling back to the plain string responder,
+     * so tests can assert on a fake provider's streamed {@code finishReason}/
+     * {@code toolCalls} too (e.g. covering {@code chatStream()} against a
+     * tool-call-shaped response) the same way {@link #complete} already lets them.
+     */
     @Override
     public Stream<CompletionChunk> stream(CompletionRequest request) {
         receivedRequests.add(request);
+        if (fullResponder != null) {
+            CompletionResponse response = fullResponder.apply(request);
+            return Stream.of(
+                    CompletionChunk.ofDelta(response.content() == null ? "" : response.content()),
+                    CompletionChunk.finished(response.finishReason())
+            );
+        }
         String content = responder.apply(request);
         return Stream.of(CompletionChunk.ofDelta(content), CompletionChunk.finished());
     }
