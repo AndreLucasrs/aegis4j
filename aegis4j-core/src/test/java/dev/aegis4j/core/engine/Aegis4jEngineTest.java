@@ -3,10 +3,18 @@ package dev.aegis4j.core.engine;
 import dev.aegis4j.api.guard.Guard;
 import dev.aegis4j.api.guard.GuardContext;
 import dev.aegis4j.api.guard.GuardResult;
+import dev.aegis4j.api.provider.CompletionChunk;
+import dev.aegis4j.api.provider.CompletionRequest;
+import dev.aegis4j.api.provider.CompletionResponse;
+import dev.aegis4j.api.provider.FinishReason;
+import dev.aegis4j.api.provider.ModelInfo;
+import dev.aegis4j.api.provider.Provider;
+import dev.aegis4j.api.provider.Usage;
 import dev.aegis4j.api.rag.RetrievedChunk;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.api.skill.ProgrammaticSkill;
 import dev.aegis4j.api.skill.SkillDescriptor;
+import dev.aegis4j.api.usage.UsageTracker;
 import dev.aegis4j.core.guard.GuardChain;
 import dev.aegis4j.core.routing.ModelRouter;
 import dev.aegis4j.core.skill.SkillRegistry;
@@ -14,9 +22,11 @@ import dev.aegis4j.testkit.FakeProvider;
 import dev.aegis4j.testkit.FakeRetriever;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -223,5 +233,81 @@ class Aegis4jEngineTest {
 
         assertThatThrownBy(() -> engine.chat(ChatRequest.builder().userInput("hi").build()))
                 .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void reportsUsageToConfiguredTrackerAfterChat() {
+        Provider provider = new UsageReportingProvider("fake", new Usage(12, 34, 46));
+        List<Usage> recorded = new ArrayList<>();
+        UsageTracker tracker = (providerId, model, usage) -> {
+            assertThat(providerId).isEqualTo("fake");
+            assertThat(model).isEqualTo("m");
+            recorded.add(usage);
+        };
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .usageTracker(tracker)
+                .build();
+
+        engine.chat(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build());
+
+        assertThat(recorded).containsExactly(new Usage(12, 34, 46));
+    }
+
+    @Test
+    void neverCallsUsageTrackerFromChatStream() {
+        Provider provider = new UsageReportingProvider("fake", new Usage(1, 2, 3));
+        List<Usage> recorded = new ArrayList<>();
+        UsageTracker tracker = (providerId, model, usage) -> recorded.add(usage);
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .provider(provider)
+                .usageTracker(tracker)
+                .build();
+
+        engine.chatStream(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build()).toList();
+
+        assertThat(recorded).isEmpty();
+    }
+
+    @Test
+    void worksWithoutUsageTrackerConfigured() {
+        FakeProvider provider = FakeProvider.withId("fake").respondingWith("ok");
+        Aegis4jEngine engine = Aegis4jEngine.builder().provider(provider).build();
+
+        assertThat(engine.chat(ChatRequest.builder().providerId("fake").model("m").userInput("hi").build()).content())
+                .isEqualTo("ok");
+    }
+
+    /** Minimal {@link Provider} double that returns a caller-supplied {@link Usage} instead of {@link Usage#UNKNOWN}. */
+    private static final class UsageReportingProvider implements Provider {
+        private final String id;
+        private final Usage usage;
+
+        UsageReportingProvider(String id, Usage usage) {
+            this.id = id;
+            this.usage = usage;
+        }
+
+        @Override
+        public String id() {
+            return id;
+        }
+
+        @Override
+        public CompletionResponse complete(CompletionRequest request) {
+            return new CompletionResponse("resp-1", request.model(), "ok", FinishReason.STOP, usage, List.of());
+        }
+
+        @Override
+        public Stream<CompletionChunk> stream(CompletionRequest request) {
+            return Stream.of(CompletionChunk.ofDelta("ok"), CompletionChunk.finished());
+        }
+
+        @Override
+        public List<ModelInfo> listModels() {
+            return List.of(new ModelInfo(id, id, 8192));
+        }
     }
 }

@@ -10,6 +10,7 @@ import dev.aegis4j.api.rag.RetrievedChunk;
 import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.api.routing.RoutingContext;
+import dev.aegis4j.api.usage.UsageTracker;
 import dev.aegis4j.core.guard.GuardChain;
 import dev.aegis4j.core.persona.PersonaManager;
 import dev.aegis4j.core.prompt.PromptAssembler;
@@ -41,6 +42,7 @@ public final class Aegis4jEngine {
     private final PersonaManager personaManager;
     private final Retriever retriever;
     private final ModelRouter modelRouter;
+    private final UsageTracker usageTracker;
     private final PromptAssembler promptAssembler = new PromptAssembler();
 
     private Aegis4jEngine(Builder builder) {
@@ -54,6 +56,7 @@ public final class Aegis4jEngine {
         this.personaManager = builder.personaManager;
         this.retriever = builder.retriever;
         this.modelRouter = builder.modelRouter;
+        this.usageTracker = builder.usageTracker;
     }
 
     public static Builder builder() {
@@ -87,6 +90,10 @@ public final class Aegis4jEngine {
 
         CompletionResponse response = provider.complete(completionRequest);
 
+        if (usageTracker != null) {
+            usageTracker.record(route.providerId(), response.model(), response.usage());
+        }
+
         String sanitizedOutput = guardChain.runOutput(ctx, response.content());
 
         return new CompletionResponse(
@@ -105,6 +112,12 @@ public final class Aegis4jEngine {
      * retrieval, routing and prompt assembly — output guards are NOT applied
      * to streamed chunks. Callers that need guaranteed output guarding must
      * use {@link #chat}.
+     *
+     * <p>v1 limitation: {@link dev.aegis4j.api.provider.CompletionChunk} carries no {@code Usage}, so
+     * a configured {@link UsageTracker} is never called from this method —
+     * only {@link #chat} records usage. Providers would need to surface
+     * usage on the terminal chunk before this method could track streamed
+     * calls.
      */
     public Stream<dev.aegis4j.api.provider.CompletionChunk> chatStream(ChatRequest request) {
         GuardContext ctx = new GuardContext(request.requestId(), request.userId(), Map.of());
@@ -181,6 +194,7 @@ public final class Aegis4jEngine {
         private PersonaManager personaManager = PersonaManager.none();
         private Retriever retriever;
         private ModelRouter modelRouter;
+        private UsageTracker usageTracker;
         private Boolean skillCatalogInSystemPrompt;
 
         public Builder providerRegistry(ProviderRegistry providerRegistry) {
@@ -242,6 +256,19 @@ public final class Aegis4jEngine {
         public Builder modelRouter(ModelRouter modelRouter) {
             if (modelRouter != null) {
                 this.modelRouter = modelRouter;
+            }
+            return this;
+        }
+
+        /**
+         * Opts into usage tracking: once set, {@link #chat} reports every
+         * successful completion's {@link dev.aegis4j.api.provider.Usage} to
+         * this tracker. {@code null} is a safe no-op — leaves usage tracking
+         * disabled (or whatever was set before).
+         */
+        public Builder usageTracker(UsageTracker usageTracker) {
+            if (usageTracker != null) {
+                this.usageTracker = usageTracker;
             }
             return this;
         }
