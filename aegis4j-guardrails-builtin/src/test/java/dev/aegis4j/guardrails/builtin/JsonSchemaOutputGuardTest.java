@@ -86,6 +86,14 @@ class JsonSchemaOutputGuardTest {
     }
 
     @Test
+    void blocksNullOutputInsteadOfThrowing() {
+        var guard = JsonSchemaOutputGuard.of(PERSON_SCHEMA);
+        GuardResult result = guard.checkOutput(ctx, null);
+        assertThat(result).isInstanceOf(GuardResult.Block.class);
+        assertThat(((GuardResult.Block) result).reasonCode()).isEqualTo("output-not-json");
+    }
+
+    @Test
     void inputIsAlwaysPassThrough() {
         var guard = JsonSchemaOutputGuard.of(PERSON_SCHEMA);
         assertThat(guard.checkInput(ctx, "not json")).isInstanceOf(GuardResult.Pass.class);

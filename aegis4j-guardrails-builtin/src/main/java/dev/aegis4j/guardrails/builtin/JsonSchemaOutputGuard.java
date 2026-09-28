@@ -27,6 +27,14 @@ import java.util.stream.Collectors;
  * <p>Output that is not valid JSON, or that is valid JSON but does not
  * satisfy the schema, is rejected via {@link GuardResult#block}; the guard
  * never attempts to repair or coerce the output.
+ *
+ * <p><b>This guard does not itself cap how much text it parses.</b>
+ * {@link #checkOutput} materializes the entire input into a JSON tree before
+ * validating it, so an unbounded output is an unbounded parse/memory cost.
+ * Place a size guard such as {@link MaxLengthGuard} <em>before</em> this one
+ * in the guard chain if the output source is not already trusted/bounded —
+ * this guard intentionally leaves that ordering to whoever composes the
+ * chain rather than imposing its own limit.
  */
 public final class JsonSchemaOutputGuard extends GuardAdapter {
 
@@ -58,6 +66,13 @@ public final class JsonSchemaOutputGuard extends GuardAdapter {
 
     @Override
     public GuardResult checkOutput(GuardContext ctx, String text) {
+        // Null output (e.g. a tool-call-only turn with no text content) has
+        // no JSON to validate — readTree(String) would NPE on it, so it's
+        // treated the same as any other non-JSON output: rejected.
+        if (text == null) {
+            return GuardResult.block("output-not-json", "Output is not valid JSON: no content");
+        }
+
         JsonNode node;
         try {
             node = MAPPER.readTree(text);

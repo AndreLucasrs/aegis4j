@@ -5,7 +5,10 @@ import dev.aegis4j.api.guard.GuardContext;
 import dev.aegis4j.api.guard.GuardResult;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -27,44 +30,25 @@ import java.util.regex.Pattern;
  * access, and output validation — never as the sole defense against prompt
  * injection.
  *
- * <p>The default pattern set ({@link #DEFAULT_PATTERNS}) is a starting point,
- * not a fixed list: callers can extend it ({@link #defaultPatternsPlus}) or
- * replace it entirely ({@link #of}) with organization-specific heuristics.
+ * <p>The default pattern set ({@link #DEFAULT_PATTERNS}, backed by the named
+ * {@link InjectionCategory} entries) is a starting point, not a fixed list:
+ * callers can pick individual categories ({@link #categories}), extend the
+ * defaults with arbitrary regexes ({@link #defaultPatternsPlus}), or replace
+ * them entirely ({@link #of}) with organization-specific heuristics.
+ *
+ * <p>The block message deliberately does not echo which pattern matched or
+ * any of the input text: doing so would hand an attacker probing the endpoint
+ * a map of exactly what to paraphrase around, defeating the guard. Callers
+ * who need the matched category for internal debugging/audit logs should do
+ * so out of band (e.g. by wrapping this guard), not through the message that
+ * reaches the caller.
  */
 public final class PromptInjectionGuard extends GuardAdapter {
 
-    /** Sensible default set of bilingual (pt-BR / en) prompt-injection heuristics. */
-    public static final List<Pattern> DEFAULT_PATTERNS = List.of(
-            // "ignore previous instructions" and variants
-            Pattern.compile("(?i)ignor[ae]\\s+(todas\\s+)?(as\\s+|suas\\s+)?instru[cç][õo]es\\s+(anterior(es)?|acima|pr[ée]via)"),
-            Pattern.compile("(?i)ignore\\s+(all\\s+|your\\s+|any\\s+)?(previous|prior|above|earlier)\\s+instructions"),
-            Pattern.compile("(?i)desconsidere\\s+(as\\s+)?instru[cç][õo]es\\s+(anterior(es)?|acima)"),
-            Pattern.compile("(?i)disregard\\s+(all\\s+|your\\s+)?(previous|prior|above)\\s+(instructions|rules|prompt)"),
-            Pattern.compile("(?i)esque[cç]a\\s+(todas\\s+)?(as\\s+)?(suas\\s+)?regras"),
-            Pattern.compile("(?i)forget\\s+(all\\s+|your\\s+)?(previous\\s+)?(rules|instructions|guidelines)"),
-            // system-prompt exfiltration attempts
-            Pattern.compile("(?i)revele?\\s+(o\\s+|seu\\s+)?system\\s*prompt"),
-            Pattern.compile("(?i)reveal\\s+(your|the)\\s+system\\s*prompt"),
-            Pattern.compile("(?i)(mostre|exiba|imprima|repita)\\s+(suas\\s+|as\\s+)?instru[cç][õo]es\\s+(de\\s+sistema|iniciais)"),
-            Pattern.compile("(?i)(show|print|repeat)\\s+(me\\s+)?your\\s+(system\\s+)?(prompt|instructions)"),
-            Pattern.compile("(?i)what\\s+(are|were)\\s+your\\s+(original\\s+)?instructions"),
-            Pattern.compile("(?i)quais\\s+s[aã]o\\s+suas\\s+instru[cç][õo]es\\s+(originais|iniciais|de\\s+sistema)"),
-            // forced role/persona overrides
-            Pattern.compile("(?i)voc[eê]\\s+agora\\s+[ée]\\s+"),
-            Pattern.compile("(?i)you\\s+are\\s+now\\s+"),
-            Pattern.compile("(?i)from\\s+now\\s+on\\s*,?\\s+you\\s+(are|will|must)"),
-            Pattern.compile("(?i)a\\s+partir\\s+de\\s+agora\\s*,?\\s+voc[eê]\\s+(é|deve|vai)"),
-            Pattern.compile("(?i)finja\\s+(que\\s+)?(voc[eê]\\s+)?(n[aã]o\\s+tem|[ée])"),
-            Pattern.compile("(?i)pretend\\s+(that\\s+)?you\\s+(are|have\\s+no)"),
-            // developer / jailbreak modes
-            Pattern.compile("(?i)modo\\s+desenvolvedor"),
-            Pattern.compile("(?i)developer\\s+mode"),
-            Pattern.compile("(?i)\\bDAN\\b"),
-            Pattern.compile("(?i)jailbreak"),
-            Pattern.compile("(?i)modo\\s+sem\\s+restri[cç][õo]es"),
-            Pattern.compile("(?i)unrestricted\\s+mode"),
-            Pattern.compile("(?i)sem\\s+filtros?\\s+(de\\s+seguran[cç]a|[ée]ticos)")
-    );
+    /** Sensible default set of bilingual (pt-BR / en) prompt-injection heuristics, one per {@link InjectionCategory}. */
+    public static final List<Pattern> DEFAULT_PATTERNS = Arrays.stream(InjectionCategory.values())
+            .map(InjectionCategory::pattern)
+            .toList();
 
     private final List<Pattern> patterns;
 
@@ -72,9 +56,14 @@ public final class PromptInjectionGuard extends GuardAdapter {
         this.patterns = List.copyOf(patterns);
     }
 
-    /** Uses only {@link #DEFAULT_PATTERNS}. */
+    /** Uses only {@link #DEFAULT_PATTERNS} (every {@link InjectionCategory}). */
     public static PromptInjectionGuard defaultPatterns() {
         return new PromptInjectionGuard(DEFAULT_PATTERNS);
+    }
+
+    /** Uses only the given named categories — for disabling or auditing specific default heuristics. */
+    public static PromptInjectionGuard categories(Set<InjectionCategory> categories) {
+        return new PromptInjectionGuard(EnumSet.copyOf(categories).stream().map(InjectionCategory::pattern).toList());
     }
 
     /** Uses only the given patterns, ignoring {@link #DEFAULT_PATTERNS} entirely. */
@@ -96,11 +85,18 @@ public final class PromptInjectionGuard extends GuardAdapter {
 
     @Override
     public GuardResult checkInput(GuardContext ctx, String text) {
+        // No text content to inspect (e.g. a tool-only turn) — nothing to flag.
+        if (text == null) {
+            return GuardResult.pass();
+        }
         for (Pattern pattern : patterns) {
             Matcher matcher = pattern.matcher(text);
             if (matcher.find()) {
+                // Deliberately generic: neither the pattern nor the matched
+                // substring is included, so an attacker probing the endpoint
+                // can't read off what to paraphrase around.
                 return GuardResult.block("prompt-injection-suspected",
-                        "Input matches a known prompt-injection heuristic (pattern: " + pattern.pattern() + ")");
+                        "Input matched a known prompt-injection pattern");
             }
         }
         return GuardResult.pass();
