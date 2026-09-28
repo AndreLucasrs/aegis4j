@@ -85,7 +85,7 @@ class Aegis4jServerE2ETest {
                 .skillRegistry(skillRegistry)
                 .build();
 
-        app = Aegis4jServerApp.createApp(engine, OllamaProvider.ID);
+        app = Aegis4jServerApp.createApp(engine, OllamaProvider.ID, null);
         app.start(0);
     }
 
@@ -142,7 +142,7 @@ class Aegis4jServerE2ETest {
                 .modelRouter(router)
                 .build();
 
-        Javalin routedApp = Aegis4jServerApp.createApp(routedEngine, OllamaProvider.ID);
+        Javalin routedApp = Aegis4jServerApp.createApp(routedEngine, OllamaProvider.ID, null);
         routedApp.start(0);
         try {
             HttpRequest request = HttpRequest.newBuilder(
@@ -161,11 +161,95 @@ class Aegis4jServerE2ETest {
         }
     }
 
-    private HttpResponse<String> postChatCompletion(String jsonBody) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + app.port() + "/v1/chat/completions"))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+    @Test
+    void acceptsRequestWithMatchingBearerTokenWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpResponse<String> response = postChatCompletion(authApp, "Bearer secret-key", """
+                    {"model":"llama3","messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(200);
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    @Test
+    void rejectsRequestWithMissingBearerTokenWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpResponse<String> response = postChatCompletion(authApp, null, """
+                    {"messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(401);
+            JsonNode body = mapper.readTree(response.body());
+            assertThat(body.at("/error/code").asText()).isEqualTo("unauthorized");
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    @Test
+    void rejectsRequestWithWrongBearerTokenWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpResponse<String> response = postChatCompletion(authApp, "Bearer wrong-key", """
+                    {"messages":[{"role":"user","content":"hello"}]}
+                    """);
+
+            assertThat(response.statusCode()).isEqualTo(401);
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    @Test
+    void healthEndpointStaysOpenWhenApiKeyConfigured() throws Exception {
+        Javalin authApp = startAppWithApiKey("secret-key");
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + authApp.port() + "/health"))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.body()).isEqualTo("ok");
+        } finally {
+            authApp.stop();
+        }
+    }
+
+    private Javalin startAppWithApiKey(String apiKey) {
+        OllamaProvider ollama = new OllamaProvider(
+                "http://localhost:" + wireMock.port(), HttpClient.newHttpClient(), Duration.ofSeconds(5)
+        );
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(ollama);
+
+        Aegis4jEngine authEngine = Aegis4jEngine.builder()
+                .providerRegistry(providerRegistry)
+                .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000)))
                 .build();
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        Javalin authApp = Aegis4jServerApp.createApp(authEngine, OllamaProvider.ID, apiKey);
+        authApp.start(0);
+        return authApp;
+    }
+
+    private HttpResponse<String> postChatCompletion(String jsonBody) throws IOException, InterruptedException {
+        return postChatCompletion(app, null, jsonBody);
+    }
+
+    private HttpResponse<String> postChatCompletion(Javalin targetApp, String authorizationHeader, String jsonBody)
+            throws IOException, InterruptedException {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://localhost:" + targetApp.port() + "/v1/chat/completions"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody));
+        if (authorizationHeader != null) {
+            builder.header("Authorization", authorizationHeader);
+        }
+        return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
     }
 }
