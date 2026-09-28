@@ -229,6 +229,100 @@ class Aegis4jServerE2ETest {
         }
     }
 
+    @Test
+    void returnsUnifiedErrorShapeWhenMessagesEmpty() throws Exception {
+        HttpResponse<String> response = postChatCompletion("""
+                {"model":"llama3","messages":[]}
+                """);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        JsonNode body = mapper.readTree(response.body());
+        assertThat(body.at("/error/code").asText()).isEqualTo("invalid_request");
+        assertThat(body.at("/error/message").asText()).isEqualTo("messages must not be empty");
+    }
+
+    @Test
+    void streamingReturnsUnifiedJsonErrorWhenProviderUnresolvable() throws Exception {
+        ProviderRegistry emptyRegistry = new ProviderRegistry();
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .providerRegistry(emptyRegistry)
+                .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000)))
+                .build();
+
+        Javalin brokenApp = Aegis4jServerApp.createApp(engine, "missing-provider");
+        brokenApp.start(0);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + brokenApp.port() + "/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""
+                            {"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}
+                            """))
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            assertThat(response.statusCode()).isEqualTo(400);
+            JsonNode body = mapper.readTree(response.body());
+            assertThat(body.at("/error/code").asText()).isEqualTo("unknown_provider");
+            assertThat(body.at("/error/message").asText()).contains("missing-provider");
+        } finally {
+            brokenApp.stop();
+        }
+    }
+
+    @Test
+    void streamingEmitsSseErrorEventThenDoneWhenProviderFailsMidStream() throws Exception {
+        WireMockServer brokenWireMock = new WireMockServer(options().dynamicPort());
+        brokenWireMock.start();
+        brokenWireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"model":"llama3","message":{"role":"assistant","content":"hel"},"done":false}
+                        not-valid-json
+                        """)));
+
+        OllamaProvider ollama = new OllamaProvider(
+                "http://localhost:" + brokenWireMock.port(), HttpClient.newHttpClient(), Duration.ofSeconds(5)
+        );
+        ProviderRegistry providerRegistry = new ProviderRegistry();
+        providerRegistry.register(ollama);
+
+        Aegis4jEngine engine = Aegis4jEngine.builder()
+                .providerRegistry(providerRegistry)
+                .guardChain(GuardChain.of(MaxLengthGuard.forInput(4000)))
+                .build();
+
+        Javalin brokenApp = Aegis4jServerApp.createApp(engine, OllamaProvider.ID);
+        brokenApp.start(0);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + brokenApp.port() + "/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""
+                            {"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}
+                            """))
+                    .build();
+            HttpResponse<Stream<String>> response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+
+            assertThat(response.statusCode()).isEqualTo(200);
+
+            List<String> dataLines;
+            try (Stream<String> lines = response.body()) {
+                dataLines = lines.filter(line -> line.startsWith("data: ")).map(line -> line.substring("data: ".length())).toList();
+            }
+
+            assertThat(dataLines).hasSizeGreaterThanOrEqualTo(2);
+            assertThat(dataLines.get(dataLines.size() - 1)).isEqualTo("[DONE]");
+
+            JsonNode errorEvent = mapper.readTree(dataLines.get(dataLines.size() - 2));
+            assertThat(errorEvent.at("/error/code").asText()).isEqualTo("provider_error");
+        } finally {
+            brokenApp.stop();
+            brokenWireMock.stop();
+        }
+    }
+
     private HttpResponse<String> postChatCompletion(String jsonBody) throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + app.port() + "/v1/chat/completions"))
                 .header("Content-Type", "application/json")

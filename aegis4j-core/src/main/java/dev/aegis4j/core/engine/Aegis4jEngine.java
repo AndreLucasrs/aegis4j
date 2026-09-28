@@ -105,8 +105,21 @@ public final class Aegis4jEngine {
      * retrieval, routing and prompt assembly — output guards are NOT applied
      * to streamed chunks. Callers that need guaranteed output guarding must
      * use {@link #chat}.
+     *
+     * <p>Everything up to and including {@code provider.stream(...)} runs
+     * synchronously before this method returns — input guards, retrieval,
+     * routing, prompt assembly, and opening the provider's streaming
+     * connection (which for every real HTTP-backed {@link Provider} means
+     * sending the request and reading the response status before any chunk
+     * is available). So {@link dev.aegis4j.core.guard.GuardBlockedException},
+     * {@link IllegalStateException} (routing misconfigured), a provider
+     * lookup failure, or a {@link dev.aegis4j.api.provider.ProviderException}
+     * opening the connection are all thrown directly from this call, not
+     * lazily from the returned {@link StreamedCompletion#chunks()} — a
+     * caller can therefore still turn them into an HTTP error status,
+     * exactly like {@link #chat}.
      */
-    public Stream<dev.aegis4j.api.provider.CompletionChunk> chatStream(ChatRequest request) {
+    public StreamedCompletion chatStream(ChatRequest request) {
         GuardContext ctx = new GuardContext(request.requestId(), request.userId(), Map.of());
 
         String sanitizedInput = guardChain.runInput(ctx, request.userInput());
@@ -131,7 +144,8 @@ public final class Aegis4jEngine {
                 .maxTokens(request.maxTokens())
                 .build();
 
-        return provider.stream(completionRequest);
+        Stream<dev.aegis4j.api.provider.CompletionChunk> chunks = provider.stream(completionRequest);
+        return new StreamedCompletion(request.requestId(), route.providerId(), route.model(), chunks);
     }
 
     /**

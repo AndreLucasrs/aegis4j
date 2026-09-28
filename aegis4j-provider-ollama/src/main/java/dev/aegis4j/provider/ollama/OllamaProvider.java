@@ -85,11 +85,21 @@ public final class OllamaProvider implements Provider {
         return NdjsonLineParser.nonBlankLines(response.body()).map(line -> {
             OllamaChatResponseChunk chunk = parse(line, OllamaChatResponseChunk.class);
             if (chunk.done()) {
-                return CompletionChunk.finished();
+                return CompletionChunk.finished(mapDoneReason(chunk.doneReason()));
             }
             String delta = chunk.message() == null ? "" : chunk.message().content();
             return CompletionChunk.ofDelta(delta);
         });
+    }
+
+    private FinishReason mapDoneReason(String doneReason) {
+        if (doneReason == null) {
+            return FinishReason.STOP;
+        }
+        return switch (doneReason) {
+            case "length" -> FinishReason.LENGTH;
+            default -> FinishReason.STOP;
+        };
     }
 
     @Override
