@@ -61,9 +61,9 @@ public final class Aegis4jEngine {
     }
 
     public CompletionResponse chat(ChatRequest request) {
-        GuardContext ctx = new GuardContext(request.requestId(), request.userId(), Map.of());
+        GuardContext inputCtx = new GuardContext(request.requestId(), request.userId(), Map.of());
 
-        String sanitizedInput = guardChain.runInput(ctx, request.userInput());
+        String sanitizedInput = guardChain.runInput(inputCtx, request.userInput());
         List<RetrievedChunk> retrievedChunks = resolveChunks(sanitizedInput, request);
         ResolvedRoute route = resolveRoute(sanitizedInput, request);
 
@@ -87,7 +87,11 @@ public final class Aegis4jEngine {
 
         CompletionResponse response = provider.complete(completionRequest);
 
-        String sanitizedOutput = guardChain.runOutput(ctx, response.content());
+        // Output guards (e.g. a grounding/hallucination judge) need the RAG
+        // context that was only resolved after the input-guard ctx was built.
+        GuardContext outputCtx = new GuardContext(request.requestId(), request.userId(),
+                Map.of(GuardContext.RETRIEVED_CHUNKS_KEY, retrievedChunks));
+        String sanitizedOutput = guardChain.runOutput(outputCtx, response.content());
 
         return new CompletionResponse(
                 response.id(),
