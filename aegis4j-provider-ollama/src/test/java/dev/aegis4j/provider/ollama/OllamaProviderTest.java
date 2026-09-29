@@ -6,6 +6,7 @@ import dev.aegis4j.api.provider.CompletionRequest;
 import dev.aegis4j.api.provider.CompletionResponse;
 import dev.aegis4j.api.provider.Message;
 import dev.aegis4j.api.provider.ProviderAuthException;
+import dev.aegis4j.api.provider.Usage;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -56,6 +57,42 @@ class OllamaProviderTest {
 
         assertThat(response.content()).isEqualTo("hello there");
         assertThat(response.model()).isEqualTo("llama3");
+    }
+
+    @Test
+    void completeParsesUsageFromEvalCounts() {
+        wireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"model":"llama3","message":{"role":"assistant","content":"hello there"},"done":true,"prompt_eval_count":28,"eval_count":11}
+                        """)));
+
+        CompletionResponse response = provider.complete(CompletionRequest.builder()
+                .model("llama3")
+                .messages(List.of(Message.user("hi")))
+                .build());
+
+        assertThat(response.usage().promptTokens()).isEqualTo(28);
+        assertThat(response.usage().completionTokens()).isEqualTo(11);
+        assertThat(response.usage().totalTokens()).isEqualTo(39);
+    }
+
+    @Test
+    void completeFallsBackToUnknownUsageWhenCountsAreMissing() {
+        wireMock.stubFor(post(urlEqualTo("/api/chat")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                        {"model":"llama3","message":{"role":"assistant","content":"hello there"},"done":true}
+                        """)));
+
+        CompletionResponse response = provider.complete(CompletionRequest.builder()
+                .model("llama3")
+                .messages(List.of(Message.user("hi")))
+                .build());
+
+        assertThat(response.usage()).isEqualTo(Usage.UNKNOWN);
     }
 
     @Test
