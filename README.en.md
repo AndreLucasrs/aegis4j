@@ -9,22 +9,32 @@ front of LLMs, combining:
   Anthropic, and any backend compatible with OpenAI's Chat Completions API —
   OpenAI itself, DeepSeek, Kimi/Moonshot, Groq, local servers, etc.) behind
   one common `Provider` interface.
-- **Deterministic guardrails** — rules that run in plain code (regex, length
-  limits, etc.), never another LLM call, applied to both input and output.
+- **Guardrails** — most run in plain code (regex, length limits, JSON Schema
+  validation), no LLM call involved; one opt-in guard (`HallucinationGuard`)
+  deliberately uses a second LLM as a grounding judge. Applied to both input
+  and output.
+- **Opt-in tool-calling** — a tool-execution loop wired into `chat()`, with
+  the executor always supplied by whoever embeds the library (never
+  automatic/unsafe by default).
+- **Opt-in observability** — hooks (`EngineListener`) at every pipeline
+  phase, with a ready-made OpenTelemetry-backed implementation.
+- **Opt-in usage/cost tracking** — aggregates tokens per provider+model, with
+  optional cost estimation from a configured pricing table.
 - **Skills with progressive disclosure** — only name+description enter the
   prompt by default; a skill's full body only loads when it's activated.
 - **Dual distribution** — usable as an embedded library (Gradle/Maven
   dependency) or as an HTTP sidecar (OpenAI-compatible request/response
-  shape), so any language/CLI outside the JVM can use it too.
+  shape, including SSE streaming), so any language/CLI outside the JVM can
+  use it too.
 - **MCP client** (stdio + HTTP/SSE) — connects to any MCP (Model Context
   Protocol) server to expose external tools/resources.
-- **Extensible RAG/retrieval** — a single `Retriever` interface, with
-  implementations both via direct pgvector (JDBC) and via any MCP server as
-  the search source.
+- **Extensible RAG/retrieval** — a single `Retriever` interface (direct
+  pgvector via JDBC, or any MCP server), plus a ready-made ingestion
+  pipeline (loader → chunker → embed → pgvector).
 - **Rule-based model routing** — programmatic (Java) or declarative (YAML)
   rules, whichever the library's user defines; first matching rule wins.
 
-Current status: **v0.2** — see [Scope and limitations](#scope-and-limitations-v02)
+Current status: **v0.3** — see [Scope and limitations](#scope-and-limitations-v03)
 at the bottom.
 
 ## Requirements
@@ -40,7 +50,7 @@ the repository.
 ## Installing via JitPack
 
 The code is published at [github.com/AndreLucasrs/aegis4j](https://github.com/AndreLucasrs/aegis4j)
-and tag `v0.2.0` already builds on [JitPack](https://jitpack.io/#AndreLucasrs/aegis4j) — you can
+and tag `v0.3.0` already builds on [JitPack](https://jitpack.io/#AndreLucasrs/aegis4j) — you can
 add it as a dependency without building from source:
 
 **Gradle** (`build.gradle.kts`):
@@ -54,7 +64,8 @@ dependencies {
     implementation("com.github.AndreLucasrs.aegis4j:aegis4j-core:<tag>")
     implementation("com.github.AndreLucasrs.aegis4j:aegis4j-provider-ollama:<tag>")
     // any other module: aegis4j-provider-anthropic, aegis4j-provider-openai,
-    // aegis4j-mcp, aegis4j-rag-jdbc-pgvector, aegis4j-rag-mcp, aegis4j-routing, ...
+    // aegis4j-mcp, aegis4j-rag-jdbc-pgvector, aegis4j-rag-mcp, aegis4j-routing,
+    // aegis4j-guardrails-builtin, aegis4j-observability-otel, ...
 }
 ```
 
@@ -163,6 +174,35 @@ If the input or output contains an email, an API key, a valid credit card
 (Luhn-checked) or an IPv4 address, `RegexPiiGuard` redacts it automatically
 before continuing through the pipeline. An input longer than
 `AEGIS4J_MAX_INPUT_CHARS` is blocked with HTTP 400.
+
+**Streaming**: add `"stream": true` to get `chat.completion.chunk` events
+over SSE, terminated by `data: [DONE]`:
+
+```bash
+curl -N -X POST http://localhost:8686/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "qwen2.5-coder:7b",
+        "messages": [{"role": "user", "content": "count to 3"}],
+        "stream": true
+      }'
+```
+
+```
+data: {"id":"...","object":"chat.completion.chunk","created":...,"model":"qwen2.5-coder:7b","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"...","object":"chat.completion.chunk","created":...,"model":"qwen2.5-coder:7b","choices":[{"index":0,"delta":{"content":"1, 2, 3"},"finish_reason":null}]}
+
+data: {"id":"...","object":"chat.completion.chunk","created":...,"model":"qwen2.5-coder:7b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+Output guards (`RegexPiiGuard`, etc.) **do not run** on streamed
+responses — only in non-streaming `chat()`. Streaming also skips the
+tool-calling loop (see [Tool-calling](#tool-calling)) and does not report
+usage to a configured `UsageTracker` (`CompletionChunk` carries no `Usage`
+yet).
 
 ## Using it as an embedded library (Java)
 
@@ -433,6 +473,164 @@ Retrieval runs on every turn once a `Retriever` is configured (v0.2 =
 unconditional, no relevance gating yet), and the result enters the prompt as
 a fresh `Context:` block on every call.
 
+### Document ingestion
+
+For the write side (populating pgvector), `aegis4j-rag-jdbc-pgvector` also
+ships a `DocumentLoader` → `Chunker` → `PgVectorIngester` pipeline:
+
+```java
+DocumentLoader loader = new TextDocumentLoader(Path.of("docs")); // or MarkdownDocumentLoader(dir) for .md
+Chunker chunker = new FixedSizeChunker(1000, 100); // chunk size, overlap in characters
+
+PgVectorIngester ingester = new PgVectorIngester(
+        dataSource, embedder, PgVectorRetrieverConfig.defaults("document_chunks"), chunker);
+
+int chunksWritten = ingester.ingest(loader);
+```
+
+Reuses the same `PgVectorRetrieverConfig` the `PgVectorRetriever` uses (same
+table, same columns), so writing and reading never drift apart on schema.
+Re-ingesting the same document upserts (`ON CONFLICT ... DO UPDATE`) and
+deletes any row orphaned by an earlier ingestion that produced more chunks
+than the current version — re-ingestion is a supported operation, not a
+gotcha.
+
+> **Under evaluation:** [PageIndex](https://github.com/VectifyAI/PageIndex)
+> proposes a "vectorless" RAG — instead of embeddings, it builds a
+> hierarchical tree of the document's structure and has an LLM
+> navigate/reason over it. It only ships a Python SDK today, so it can't be
+> depended on directly; the cheapest integration path would be via
+> `McpToolRetriever` (`aegis4j-rag-mcp`), since their Cloud offering exposes
+> an MCP server — no new code in the library needed. No dedicated
+> integration is planned yet, this is just documenting it as a known option.
+
+## Tool-calling
+
+Opt-in — off by default, so no existing consumer's behavior changes without
+calling this explicitly:
+
+```java
+ToolDefinition weatherTool = new ToolDefinition(
+        "get_weather",
+        "Returns the current weather for a city",
+        Map.of("type", "object",
+               "properties", Map.of("city", Map.of("type", "string")),
+               "required", List.of("city")));
+
+ToolExecutor executor = call -> {
+    // call.argumentsJson() is the raw JSON the model sent — parse and validate it yourself.
+    // Execution is always the embedder's responsibility: aegis4j-core never runs anything
+    // on its own or decides what's safe to call.
+    return "{\"tempC\": 24, \"condition\": \"sunny\"}";
+};
+
+Aegis4jEngine engine = Aegis4jEngine.builder()
+        .provider(OpenAiCompatibleProvider.openAi())
+        .tools(List.of(weatherTool), executor)
+        .maxToolIterations(5) // default; hard cap on total provider calls per chat(), the first one included
+        .build();
+
+CompletionResponse response = engine.chat(ChatRequest.builder()
+        .providerId("openai").model("gpt-5")
+        .userInput("what's the weather in São Paulo right now?")
+        .build());
+```
+
+If the model requests a tool, the engine calls `executor.execute(call)`,
+injects the result back into the conversation, and calls the provider
+again — until the response has no more pending tool calls or
+`maxToolIterations` is exceeded (`ToolCallLimitExceededException`). A tool
+that throws does not abort the exchange: the engine feeds the model only the
+thrown exception's class name (never `e.getMessage()`, which may carry
+sensitive detail) and lets the model decide what to do.
+
+**Important limitations:**
+
+- **Only works in `chat()`, not `chatStream()`** — streaming never sends
+  `tools` or inspects the response for tool calls, even when configured.
+- **Only `OpenAiCompatibleProvider` actually sends `tools`/parses
+  `tool_calls` today** — `AnthropicProvider` and `OllamaProvider` silently
+  ignore `tools` (no error, no log). Route tool-calling to an
+  OpenAI-compatible provider until the other two gain support.
+- **The guard chain doesn't cover the loop**: only the initial input and the
+  final answer pass through guards — intermediate tool results (a classic
+  prompt-injection vector when a tool talks to an external system) and the
+  model's reasoning between calls are not sanitized.
+
+## Guardrails
+
+| Guard | What it does |
+|---|---|
+| `MaxLengthGuard` | Blocks text above a character limit (input and/or output). |
+| `RegexPiiGuard` | Redacts email, API key, credit card (Luhn-checked), IPv4. |
+| `PromptInjectionGuard` | Heuristic (bilingual pt/en regex) against common injection patterns — "ignore previous instructions", system-prompt exfiltration, jailbreak framings. **Not a security boundary**, just one more signal. |
+| `JsonSchemaOutputGuard` | Validates that the output is valid JSON matching a supplied JSON Schema. |
+| `HallucinationGuard` | LLM-as-judge: uses a second `Provider` to assess whether the response is grounded in the retrieved (RAG) context. `WARN` mode (default, annotates a warning) or `STRICT` (blocks); fails open on any judge failure/unparseable response. |
+
+```java
+GuardChain chain = GuardChain.of(
+        MaxLengthGuard.forInput(4000),
+        RegexPiiGuard.allPatterns(),
+        PromptInjectionGuard.defaultPatterns(),
+        HallucinationGuard.warning(judgeProvider, "gpt-5-mini") // or .strict(...)
+);
+```
+
+`HallucinationGuard` only calls the judge when there's retrieved context
+(`Retriever` configured) — with no RAG, there's nothing to compare against,
+so it passes through at no extra cost.
+
+## Observability
+
+Opt-in hooks (`EngineListener`) at every pipeline phase — no listener
+configured, zero cost:
+
+```java
+Aegis4jEngine engine = Aegis4jEngine.builder()
+        .provider(OllamaProvider.create())
+        .listener(new OtelEngineListener(openTelemetry)) // aegis4j-observability-otel
+        .build();
+```
+
+`OtelEngineListener` creates one span per `chat()`/`chatStream()` call,
+filling in attributes (`provider_id`, `model`, call duration, tokens,
+`finish_reason`) as each phase completes. To write your own:
+`EngineListener` has 8 empty `default` methods (`onChatStarted`,
+`onInputGuardComplete`, `onRetrievalComplete`, `onRouteResolved`,
+`onProviderCallComplete`, `onOutputGuardComplete`, `onChatComplete`,
+`onChatFailed`) — override only the ones you care about. A listener's
+exception never affects the real response (isolated and logged, never
+propagated) — not even an `Error` brings down the pipeline.
+
+The OpenTelemetry dependency (`io.opentelemetry:opentelemetry-api`) stays
+isolated in the `aegis4j-observability-otel` module — it never leaks into
+`aegis4j-core`.
+
+## Usage & cost tracking
+
+```java
+InMemoryUsageTracker tracker = new InMemoryUsageTracker(Map.of(
+        "gpt-5", new InMemoryUsageTracker.PricingRate(0.005, 0.015) // cost per 1k tokens: prompt, completion
+));
+
+Aegis4jEngine engine = Aegis4jEngine.builder()
+        .provider(OpenAiCompatibleProvider.openAi())
+        .usageTracker(tracker)
+        .build();
+
+// after a few chat() calls...
+long tokens = tracker.totalTokens("openai", "gpt-5");
+double cost = tracker.estimatedCost("openai", "gpt-5");
+```
+
+Aggregates by `providerId`+`model` (the key is the model your `ChatRequest`
+asked for, not necessarily what the provider echoes back — e.g. `gpt-5` vs.
+`gpt-5-2025-08-07` — configure pricing under the same string your requests
+use). `InMemoryUsageTracker` is process-local and resets on JVM restart; for
+persistence, implement `UsageTracker` (a one-method interface) against your
+own database/billing system. Streaming isn't tracked yet (`CompletionChunk`
+carries no `Usage`).
+
 ## Model routing
 
 Programmatic:
@@ -498,7 +696,7 @@ yet (`listPrompts()` throws `UnsupportedOperationException` until v0.3).
 |------------------------------------|---------------------------------------------------------------------|
 | `aegis4j-api`                    | Contracts: `Provider`, `Guard`, `Skill`, `Persona`                 |
 | `aegis4j-core`                   | `Aegis4jEngine`, `GuardChain`, `SkillRegistry`, `ProviderRegistry`  |
-| `aegis4j-guardrails-builtin`     | `MaxLengthGuard`, `RegexPiiGuard`                                   |
+| `aegis4j-guardrails-builtin`     | `MaxLengthGuard`, `RegexPiiGuard`, `PromptInjectionGuard`, `JsonSchemaOutputGuard`, `HallucinationGuard` |
 | `aegis4j-skills`                 | `MarkdownSkillLoader`                                               |
 | `aegis4j-provider-http-support`  | HTTP plumbing shared across providers                              |
 | `aegis4j-provider-ollama`        | `Provider` for Ollama                                               |
@@ -507,11 +705,12 @@ yet (`listPrompts()` throws `UnsupportedOperationException` until v0.3).
 | `aegis4j-server`                 | HTTP sidecar (Javalin)                                              |
 | `aegis4j-testkit`                | `FakeProvider`, `FakeRetriever` and test helpers                    |
 | `aegis4j-mcp`                     | MCP client (`McpClient`, stdio and HTTP/SSE transports)             |
-| `aegis4j-rag-jdbc-pgvector`       | `PgVectorRetriever` (direct JDBC, no ORM)                           |
+| `aegis4j-rag-jdbc-pgvector`       | `PgVectorRetriever` (query) + `PgVectorIngester`/`DocumentLoader`/`Chunker` (ingestion) — direct JDBC, no ORM |
 | `aegis4j-rag-mcp`                 | `McpToolRetriever` (retrieval via any MCP server's tool)            |
 | `aegis4j-routing`                 | `KeywordRoutingRule`, `RegexRoutingRule`, `YamlRoutingRuleLoader`    |
+| `aegis4j-observability-otel`      | `OtelEngineListener` — OpenTelemetry-backed `EngineListener` implementation |
 
-## Scope and limitations (v0.2)
+## Scope and limitations (v0.3)
 
 **v0.1** (kept): Ollama provider, `MaxLengthGuard` + `RegexPiiGuard` guards,
 declarative skills with progressive disclosure, server with
@@ -528,16 +727,31 @@ an explicit value always wins over a routed one; `AnthropicProvider`
 Kimi/Moonshot and any other backend compatible with OpenAI's Chat
 Completions API).
 
-Out of scope for now (planned for v0.3+):
+**v0.3** (new): SSE streaming on the server (`"stream": true` on the
+request, OpenAI-compatible `text/event-stream` response); opt-in
+tool-calling loop (`Builder.tools(...)`, execution always the embedder's
+responsibility — see [Tool-calling](#tool-calling)); new guards —
+`PromptInjectionGuard` (heuristic), `JsonSchemaOutputGuard`,
+`HallucinationGuard` (LLM-as-judge); RAG ingestion pipeline
+(`DocumentLoader`/`Chunker`/`PgVectorIngester`, upsert + orphan cleanup on
+re-ingestion); opt-in usage/cost tracking (`UsageTracker`/
+`InMemoryUsageTracker`); opt-in observability (`EngineListener` + the
+`aegis4j-observability-otel` OpenTelemetry-backed module).
 
-- SSE streaming on the server (the engine already supports `chatStream`, but
-  the server doesn't relay it over SSE yet)
+Out of scope for now (planned for v0.4+):
+
 - Programmatic skills registered on the server, persona
 - `/v1/skills`, `/v1/guards`, `/v1/models`, `/v1/config` endpoints
 - Structured output via `ResponseFormat.JsonSchema` (the contract already
   exists in the API, but isn't validated yet)
-- Additional guards: `PromptInjectionHeuristicGuard`, `ProfanityBlocklistGuard`,
-  `ContentTypeAllowlistGuard`, `CompetitorMentionGuard`
+- Additional guards: `ProfanityBlocklistGuard`, `ContentTypeAllowlistGuard`,
+  `CompetitorMentionGuard`
+- Tool-calling in `chatStream()`; `tools` support in `AnthropicProvider`/
+  `OllamaProvider` (they silently ignore `tools` today); tool-calling
+  round-trips over the HTTP server (`ChatMessageDto` carries no
+  `toolCalls`/`toolCallId`)
+- Usage/cost tracking in `chatStream()` (`CompletionChunk` carries no
+  `Usage` yet)
 - The MCP protocol's `prompts/*` (`McpClient.listPrompts()` throws
   `UnsupportedOperationException`)
 - A concrete `Embedder` (`OllamaEmbedder`) — which is why
