@@ -38,6 +38,21 @@ de LLMs, combinando:
 Status atual: **v0.3** — ver [Escopo e limitações](#escopo-e-limitações-v03)
 no final.
 
+## Onde encontrar cada coisa
+
+| Capacidade | Seção |
+|---|---|
+| Providers (Ollama, Anthropic, OpenAI-compatible) | [Conectando em cada provider](#conectando-em-cada-provider) |
+| Guardrails (PII, tamanho, prompt injection, JSON Schema, hallucination) | [Guardrails](#guardrails) |
+| Skills com progressive disclosure | [Criando uma skill declarativa](#criando-uma-skill-declarativa) |
+| Tool-calling (loop opt-in) | [Tool-calling](#tool-calling) |
+| RAG/retrieval + ingestão de documentos | [RAG/retrieval](#ragretrieval) ([ingestão](#ingestão-de-documentos)) |
+| Roteamento de modelo | [Roteamento de modelo](#roteamento-de-modelo) |
+| Observabilidade/tracing | [Observabilidade](#observabilidade) |
+| Usage/cost tracking | [Usage & cost tracking](#usage--cost-tracking) |
+| Cliente MCP | [Cliente MCP](#cliente-mcp) |
+| Servidor HTTP (sidecar) + streaming SSE | [Rodando o sidecar HTTP](#rodando-o-sidecar-http) |
+
 ## Requisitos
 
 - Java 17+ (toolchain do build usa Java 17 — qualquer JVM 17 ou mais nova roda
@@ -118,7 +133,7 @@ Variáveis de ambiente (todas opcionais):
 | `AEGIS4J_MAX_INPUT_CHARS`     | `4000`                    | Teto de caracteres de input (guard `MaxLengthGuard`)      |
 | `AEGIS4J_SERVER_API_KEY`      | *(nenhum)*                | Protege o próprio servidor: se setada, todo request para endpoints não-`/health` precisa do header `Authorization: Bearer <chave>`, senão retorna `401`. Se não setada, o servidor fica aberto (comportamento padrão, compatível com versões anteriores) |
 | `AEGIS4J_SKILLS_DIR`          | *(nenhum)*                | Diretório com skills declarativas (`.md` + frontmatter)   |
-| `AEGIS4J_RETRIEVER`           | *(nenhum)*                | `mcp` — ativa retrieval via MCP (`pgvector` lança erro explícito em v0.2, ver [limitações](#escopo-e-limitações-v02)) |
+| `AEGIS4J_RETRIEVER`           | *(nenhum)*                | `mcp` — ativa retrieval via MCP (`pgvector` lança erro explícito em v0.2, ver [limitações](#escopo-e-limitações-v03)) |
 | `AEGIS4J_MCP_RETRIEVER_TRANSPORT` | *(nenhum)*            | `stdio` ou `http`                                          |
 | `AEGIS4J_MCP_RETRIEVER_COMMAND`   | *(nenhum)*            | Comando do servidor MCP, se transporte `stdio`             |
 | `AEGIS4J_MCP_RETRIEVER_URL`       | *(nenhum)*            | URL do servidor MCP, se transporte `http`                  |

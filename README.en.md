@@ -37,6 +37,21 @@ front of LLMs, combining:
 Current status: **v0.3** — see [Scope and limitations](#scope-and-limitations-v03)
 at the bottom.
 
+## Where to find things
+
+| Capability | Section |
+|---|---|
+| Providers (Ollama, Anthropic, OpenAI-compatible) | [Connecting to each provider](#connecting-to-each-provider) |
+| Guardrails (PII, length, prompt injection, JSON Schema, hallucination) | [Guardrails](#guardrails) |
+| Skills with progressive disclosure | [Creating a declarative skill](#creating-a-declarative-skill) |
+| Tool-calling (opt-in loop) | [Tool-calling](#tool-calling) |
+| RAG/retrieval + document ingestion | [RAG/retrieval](#ragretrieval) ([ingestion](#document-ingestion)) |
+| Model routing | [Model routing](#model-routing) |
+| Observability/tracing | [Observability](#observability) |
+| Usage/cost tracking | [Usage & cost tracking](#usage--cost-tracking) |
+| MCP client | [MCP client](#mcp-client) |
+| HTTP sidecar + SSE streaming | [Running the HTTP sidecar](#running-the-http-sidecar) |
+
 ## Requirements
 
 - Java 17+ (the build toolchain targets Java 17 — any JVM 17 or newer runs
@@ -117,7 +132,7 @@ Environment variables (all optional):
 | `AEGIS4J_MAX_INPUT_CHARS`     | `4000`                    | Input character ceiling (`MaxLengthGuard`)                 |
 | `AEGIS4J_SERVER_API_KEY`      | *(none)*                  | Protects the server itself: when set, every request to non-`/health` endpoints needs an `Authorization: Bearer <key>` header, otherwise it gets `401`. When unset, the server stays open (default, backward-compatible behavior) |
 | `AEGIS4J_SKILLS_DIR`          | *(none)*                  | Directory with declarative skills (`.md` + frontmatter)    |
-| `AEGIS4J_RETRIEVER`           | *(none)*                  | `mcp` — enables retrieval via MCP (`pgvector` throws an explicit error in v0.2, see [limitations](#scope-and-limitations-v02)) |
+| `AEGIS4J_RETRIEVER`           | *(none)*                  | `mcp` — enables retrieval via MCP (`pgvector` throws an explicit error in v0.2, see [limitations](#scope-and-limitations-v03)) |
 | `AEGIS4J_MCP_RETRIEVER_TRANSPORT` | *(none)*              | `stdio` or `http`                                          |
 | `AEGIS4J_MCP_RETRIEVER_COMMAND`   | *(none)*              | MCP server command, if transport is `stdio`                |
 | `AEGIS4J_MCP_RETRIEVER_URL`       | *(none)*              | MCP server URL, if transport is `http`                     |
