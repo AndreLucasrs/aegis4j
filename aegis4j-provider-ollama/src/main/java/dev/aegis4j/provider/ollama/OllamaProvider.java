@@ -78,7 +78,7 @@ public final class OllamaProvider implements Provider {
         OllamaChatResponseChunk chunk = parse(response.body(), OllamaChatResponseChunk.class);
         String content = chunk.message() == null ? "" : chunk.message().content();
         return new CompletionResponse(
-                "ollama-" + UUID.randomUUID(), chunk.model(), content, FinishReason.STOP, Usage.UNKNOWN, List.of()
+                "ollama-" + UUID.randomUUID(), chunk.model(), content, FinishReason.STOP, toUsage(chunk), List.of()
         );
     }
 
@@ -100,6 +100,16 @@ public final class OllamaProvider implements Provider {
             String delta = chunk.message() == null ? "" : chunk.message().content();
             return CompletionChunk.ofDelta(delta);
         });
+    }
+
+    /** {@link Usage#UNKNOWN} unless Ollama sent both counts — true for every non-streaming {@code complete()} response observed in practice, but not guaranteed by Ollama's API contract. */
+    private Usage toUsage(OllamaChatResponseChunk chunk) {
+        if (chunk.promptEvalCount() == null || chunk.evalCount() == null) {
+            return Usage.UNKNOWN;
+        }
+        int promptTokens = chunk.promptEvalCount();
+        int completionTokens = chunk.evalCount();
+        return new Usage(promptTokens, completionTokens, promptTokens + completionTokens);
     }
 
     private FinishReason mapDoneReason(String doneReason) {
