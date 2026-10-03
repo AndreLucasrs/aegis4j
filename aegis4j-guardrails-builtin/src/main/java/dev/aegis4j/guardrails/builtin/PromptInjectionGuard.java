@@ -28,7 +28,8 @@ import java.util.regex.Pattern;
  * instructions?" in a support context). Treat this guard as one signal among
  * several — pair it with system-prompt hardening, least-privilege tool
  * access, and output validation — never as the sole defense against prompt
- * injection.
+ * injection. Text hidden behind Base64, Morse, hex and similar encodings is
+ * invisible to this guard; use {@link EncodedInjectionGuard} alongside it.
  *
  * <p>The default pattern set ({@link #DEFAULT_PATTERNS}, backed by the named
  * {@link InjectionCategory} entries) is a starting point, not a fixed list:
