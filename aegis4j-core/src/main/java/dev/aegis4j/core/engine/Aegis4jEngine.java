@@ -15,6 +15,7 @@ import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.api.routing.RouteTarget;
 import dev.aegis4j.api.routing.RoutingContext;
 import dev.aegis4j.api.usage.UsageTracker;
+import dev.aegis4j.core.guard.GuardBlockedException;
 import dev.aegis4j.core.guard.GuardChain;
 import dev.aegis4j.core.observability.EngineListener;
 import dev.aegis4j.core.persona.PersonaManager;
@@ -47,6 +48,7 @@ public final class Aegis4jEngine {
 
     private final ProviderRegistry providerRegistry;
     private final GuardChain guardChain;
+    private final GuardChain untrustedContentGuards;
     private final SkillRegistry skillRegistry;
     private final SkillActivationStrategy activationStrategy;
     private final boolean includeSkillCatalogInSystemPrompt;
@@ -63,6 +65,7 @@ public final class Aegis4jEngine {
     private Aegis4jEngine(Builder builder) {
         this.providerRegistry = builder.providerRegistry;
         this.guardChain = builder.guardChain;
+        this.untrustedContentGuards = builder.untrustedContentGuards;
         this.skillRegistry = builder.skillRegistry;
         this.activationStrategy = builder.activationStrategy;
         this.includeSkillCatalogInSystemPrompt = builder.skillCatalogInSystemPrompt != null
@@ -180,7 +183,7 @@ public final class Aegis4jEngine {
 
             conversation.add(Message.assistantToolCall(response.content(), response.toolCalls()));
             for (ToolCall call : response.toolCalls()) {
-                conversation.add(Message.toolResult(call.id(), executeTool(call)));
+                conversation.add(Message.toolResult(call.id(), guardToolResult(call, request, requestId, executeTool(call))));
             }
 
             CompletionRequest followUp = CompletionRequest.builder()
@@ -209,6 +212,28 @@ public final class Aegis4jEngine {
                 a.completionTokens() + b.completionTokens(),
                 a.totalTokens() + b.totalTokens()
         );
+    }
+
+    private static final String WITHHELD_TOOL_RESULT = "Tool result withheld by security policy";
+
+    /**
+     * Runs {@link Builder#untrustedContentGuards} over a tool result. Fails
+     * closed: a block (or a guard that itself throws) withholds the result.
+     */
+    private String guardToolResult(ToolCall call, ChatRequest request, String requestId, String result) {
+        if (untrustedContentGuards.guards().isEmpty()) {
+            return result;
+        }
+        try {
+            return untrustedContentGuards.runInput(new GuardContext(requestId, request.userId(), Map.of()), result);
+        } catch (GuardBlockedException e) {
+            LOGGER.log(System.Logger.Level.WARNING, "Tool result for \"{0}\" withheld by guard ''{1}'' [{2}]",
+                    call.name(), e.guardId(), e.reasonCode());
+            return WITHHELD_TOOL_RESULT;
+        } catch (RuntimeException | Error e) {
+            LOGGER.log(System.Logger.Level.WARNING, "Untrusted-content guard threw on a tool result; withholding it", e);
+            return WITHHELD_TOOL_RESULT;
+        }
     }
 
     /**
@@ -369,7 +394,30 @@ public final class Aegis4jEngine {
             return List.of();
         }
         int topK = request.topK() != null ? request.topK() : DEFAULT_TOP_K;
-        return retriever.retrieve(sanitizedInput, topK);
+        return guardChunks(retriever.retrieve(sanitizedInput, topK), request);
+    }
+
+    /** Runs {@link Builder#untrustedContentGuards} over each chunk; blocked (or unguardable) chunks are dropped. */
+    private List<RetrievedChunk> guardChunks(List<RetrievedChunk> chunks, ChatRequest request) {
+        if (untrustedContentGuards.guards().isEmpty() || chunks.isEmpty()) {
+            return chunks;
+        }
+        GuardContext ctx = new GuardContext(request.requestId(), request.userId(), Map.of());
+        List<RetrievedChunk> kept = new ArrayList<>(chunks.size());
+        for (RetrievedChunk chunk : chunks) {
+            try {
+                String content = untrustedContentGuards.runInput(ctx, chunk.content());
+                kept.add(content.equals(chunk.content())
+                        ? chunk
+                        : new RetrievedChunk(content, chunk.sourceId(), chunk.score(), chunk.metadata()));
+            } catch (GuardBlockedException e) {
+                LOGGER.log(System.Logger.Level.WARNING, "Retrieved chunk from \"{0}\" dropped by guard ''{1}'' [{2}]",
+                        chunk.sourceId(), e.guardId(), e.reasonCode());
+            } catch (RuntimeException | Error e) {
+                LOGGER.log(System.Logger.Level.WARNING, "Untrusted-content guard threw on a retrieved chunk; dropping it", e);
+            }
+        }
+        return List.copyOf(kept);
     }
 
     /**
@@ -451,6 +499,7 @@ public final class Aegis4jEngine {
     public static final class Builder {
         private ProviderRegistry providerRegistry = new ProviderRegistry();
         private GuardChain guardChain = GuardChain.of();
+        private GuardChain untrustedContentGuards = GuardChain.of();
         private SkillRegistry skillRegistry = SkillRegistry.inMemory();
         private SkillActivationStrategy activationStrategy = new KeywordSkillActivationStrategy();
         private PersonaManager personaManager = PersonaManager.none();
@@ -475,6 +524,31 @@ public final class Aegis4jEngine {
 
         public Builder guardChain(GuardChain guardChain) {
             this.guardChain = guardChain;
+            return this;
+        }
+
+        /**
+         * Guards applied to content the model reads but the caller did not type:
+         * every retrieved RAG chunk and every tool result, before it reaches the
+         * model. These are the classic indirect prompt-injection vectors (a
+         * poisoned document, a web page or API response a tool fetched), and
+         * they are not covered by {@link #guardChain}, which only sees the
+         * user's input and the final answer. Each guard's {@code checkInput} is
+         * what runs, so e.g. {@code PromptInjectionGuard} and
+         * {@code EncodedInjectionGuard} work here unchanged.
+         *
+         * <p>Opt-in: the default is an empty chain, so existing behavior is
+         * untouched. A blocked <em>chunk</em> is dropped from the context (the
+         * request still proceeds, so one poisoned document cannot deny service);
+         * a blocked <em>tool result</em> is replaced by a fixed "withheld"
+         * message, which keeps the tool-call/result pairing valid for the
+         * provider. Neither the blocked content nor the guard's message is
+         * shown to the model. A {@code Modify} result replaces the content.
+         * Not applied by {@code chatStream()} to tool results (it has no tool
+         * loop), but retrieved chunks are guarded there too.
+         */
+        public Builder untrustedContentGuards(GuardChain untrustedContentGuards) {
+            this.untrustedContentGuards = untrustedContentGuards == null ? GuardChain.of() : untrustedContentGuards;
             return this;
         }
 
@@ -559,9 +633,10 @@ public final class Aegis4jEngine {
          * the other two providers gain equivalent support.
          *
          * <p><b>Security:</b> the guard chain only sanitizes the initial
-         * user input and the final answer — see {@link ToolExecutor} for why
-         * intermediate tool results and model reasoning inside the loop are
-         * never guarded.
+         * user input and the final answer. Intermediate tool results are
+         * guarded only if you opt in with {@link #untrustedContentGuards};
+         * model reasoning inside the loop is never guarded. See
+         * {@link ToolExecutor} for why.
          *
          * @throws IllegalArgumentException if {@code definitions} is
          *         non-null but {@code executor} is null — that combination

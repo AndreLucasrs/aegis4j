@@ -567,10 +567,11 @@ sensitive detail) and lets the model decide what to do.
   `tool_calls` today** — `AnthropicProvider` and `OllamaProvider` silently
   ignore `tools` (no error, no log). Route tool-calling to an
   OpenAI-compatible provider until the other two gain support.
-- **The guard chain doesn't cover the loop**: only the initial input and the
-  final answer pass through guards — intermediate tool results (a classic
-  prompt-injection vector when a tool talks to an external system) and the
-  model's reasoning between calls are not sanitized.
+- **The default guard chain doesn't cover the loop**: only the initial input
+  and the final answer pass through it. Tool results (a classic indirect
+  prompt-injection vector) and RAG chunks are checked only if you set
+  `untrustedContentGuards(...)` on the builder (see [Guardrails](#guardrails)).
+  The model's reasoning between calls is never sanitized.
 
 ## Guardrails
 
@@ -579,6 +580,7 @@ sensitive detail) and lets the model decide what to do.
 | `MaxLengthGuard` | Blocks text above a character limit (input and/or output). |
 | `RegexPiiGuard` | Redacts email, API key, credit card (Luhn-checked), IPv4. |
 | `PromptInjectionGuard` | Heuristic (bilingual pt/en regex) against common injection patterns — "ignore previous instructions", system-prompt exfiltration, jailbreak framings. **Not a security boundary**, just one more signal. |
+| `EncodedInjectionGuard` | Catches injection hidden behind an encoding: Base64, hex, binary, Morse, percent/`\u`/HTML entities, ROT13, reversed text, invisible Unicode tag characters ("ASCII smuggling"), full-width/homoglyphs, leetspeak and layered combinations (Base64 of Morse…). Decodes up to 3 layers and re-applies `PromptInjectionGuard`'s heuristics to every view; if the decoding budget is exhausted it **blocks** (fail-closed). `EncodedInjectionGuard.strict()` blocks any decodable text payload. Same limits: it cannot decode an unknown cipher. |
 | `JsonSchemaOutputGuard` | Validates that the output is valid JSON matching a supplied JSON Schema. |
 | `HallucinationGuard` | LLM-as-judge: uses a second `Provider` to assess whether the response is grounded in the retrieved (RAG) context. `WARN` mode (default, annotates a warning) or `STRICT` (blocks); fails open on any judge failure/unparseable response. |
 
@@ -587,9 +589,30 @@ GuardChain chain = GuardChain.of(
         MaxLengthGuard.forInput(4000),
         RegexPiiGuard.allPatterns(),
         PromptInjectionGuard.defaultPatterns(),
+        EncodedInjectionGuard.defaultPatterns(),
         HallucinationGuard.warning(judgeProvider, "gpt-5-mini") // or .strict(...)
 );
 ```
+
+### Untrusted content (indirect injection)
+
+RAG chunks and tool results are read by the model but not typed by the caller —
+the typical indirect-injection path. They do **not** go through `guardChain`;
+configure a dedicated chain (opt-in, empty by default):
+
+```java
+Aegis4jEngine engine = Aegis4jEngine.builder()
+        .guardChain(chain)
+        .untrustedContentGuards(GuardChain.of(
+                PromptInjectionGuard.defaultPatterns(),
+                EncodedInjectionGuard.defaultPatterns()))
+        .build();
+```
+
+A blocked chunk is **dropped** (the request proceeds, so one poisoned document
+can't deny service); a blocked tool result becomes the fixed message
+`Tool result withheld by security policy`. If a guard throws, the content is
+withheld too (fail-closed). None of the blocked content reaches the model.
 
 `HallucinationGuard` only calls the judge when there's retrieved context
 (`Retriever` configured) — with no RAG, there's nothing to compare against,
@@ -711,7 +734,7 @@ yet (`listPrompts()` throws `UnsupportedOperationException` until v0.3).
 |------------------------------------|---------------------------------------------------------------------|
 | `aegis4j-api`                    | Contracts: `Provider`, `Guard`, `Skill`, `Persona`                 |
 | `aegis4j-core`                   | `Aegis4jEngine`, `GuardChain`, `SkillRegistry`, `ProviderRegistry`  |
-| `aegis4j-guardrails-builtin`     | `MaxLengthGuard`, `RegexPiiGuard`, `PromptInjectionGuard`, `JsonSchemaOutputGuard`, `HallucinationGuard` |
+| `aegis4j-guardrails-builtin`     | `MaxLengthGuard`, `RegexPiiGuard`, `PromptInjectionGuard`, `EncodedInjectionGuard`, `JsonSchemaOutputGuard`, `HallucinationGuard` |
 | `aegis4j-skills`                 | `MarkdownSkillLoader`                                               |
 | `aegis4j-provider-http-support`  | HTTP plumbing shared across providers                              |
 | `aegis4j-provider-ollama`        | `Provider` for Ollama                                               |

@@ -573,11 +573,12 @@ llevar detalle sensible) y deja que el modelo decida qué hacer.
   hoy** — `AnthropicProvider` y `OllamaProvider` ignoran `tools`
   silenciosamente (sin error, sin log). Ruteá el tool-calling a un provider
   compatible con OpenAI hasta que los otros dos ganen soporte.
-- **La cadena de guards no cubre el loop**: solo la entrada inicial y la
-  respuesta final pasan por guards — los resultados intermedios de tools
-  (un vector clásico de prompt injection cuando una tool habla con un
-  sistema externo) y el razonamiento del modelo entre llamadas no se
-  sanitizan.
+- **La cadena de guards por defecto no cubre el loop**: solo la entrada
+  inicial y la respuesta final pasan por ella. Los resultados de tools (vector
+  clásico de prompt injection indirecta) y los chunks de RAG solo se verifican
+  si configurás `untrustedContentGuards(...)` en el builder (ver
+  [Guardrails](#guardrails)). El razonamiento del modelo entre llamadas nunca
+  se sanitiza.
 
 ## Guardrails
 
@@ -586,6 +587,7 @@ llevar detalle sensible) y deja que el modelo decida qué hacer.
 | `MaxLengthGuard` | Bloquea texto por encima de un límite de caracteres (entrada y/o salida). |
 | `RegexPiiGuard` | Redacta email, clave de API, tarjeta de crédito (verificada con Luhn), IPv4. |
 | `PromptInjectionGuard` | Heurístico (regex bilingüe pt/en) contra patrones comunes de inyección — "ignora las instrucciones anteriores", exfiltración del system prompt, jailbreaks. **No es una frontera de seguridad**, es una señal más. |
+| `EncodedInjectionGuard` | Detecta inyección oculta tras una codificación: Base64, hex, binario, Morse, percent/`\u`/entidades HTML, ROT13, texto invertido, caracteres Unicode invisibles ("ASCII smuggling"), full-width/homóglifos, leetspeak y capas combinadas (Base64 de Morse…). Decodifica hasta 3 capas y reaplica las heurísticas de `PromptInjectionGuard` a cada versión; si se agota el presupuesto de decodificación, **bloquea** (fail-closed). `EncodedInjectionGuard.strict()` bloquea cualquier payload de texto decodificable. Mismos límites: no decodifica un cifrado desconocido. |
 | `JsonSchemaOutputGuard` | Valida que la salida sea JSON válido que cumpla un JSON Schema dado. |
 | `HallucinationGuard` | LLM-as-judge: usa un segundo `Provider` para evaluar si la respuesta está fundamentada en el contexto recuperado (RAG). Modo `WARN` (default, anota una advertencia) o `STRICT` (bloquea); falla abierto ante cualquier fallo/respuesta no parseable del juez. |
 
@@ -594,9 +596,31 @@ GuardChain chain = GuardChain.of(
         MaxLengthGuard.forInput(4000),
         RegexPiiGuard.allPatterns(),
         PromptInjectionGuard.defaultPatterns(),
+        EncodedInjectionGuard.defaultPatterns(),
         HallucinationGuard.warning(judgeProvider, "gpt-5-mini") // o .strict(...)
 );
 ```
+
+### Contenido no confiable (inyección indirecta)
+
+Los chunks de RAG y los resultados de tools los lee el modelo pero no los
+escribe quien llama — el camino típico de inyección indirecta. **No** pasan por
+`guardChain`; configurá una cadena propia (opt-in, vacía por defecto):
+
+```java
+Aegis4jEngine engine = Aegis4jEngine.builder()
+        .guardChain(chain)
+        .untrustedContentGuards(GuardChain.of(
+                PromptInjectionGuard.defaultPatterns(),
+                EncodedInjectionGuard.defaultPatterns()))
+        .build();
+```
+
+Un chunk bloqueado se **descarta** (la solicitud sigue, así un documento
+envenenado no tumba el servicio); un resultado de tool bloqueado pasa a ser el
+mensaje fijo `Tool result withheld by security policy`. Si un guard lanza
+excepción, el contenido también se retiene (fail-closed). Nada del contenido
+bloqueado llega al modelo.
 
 `HallucinationGuard` solo llama al juez cuando hay contexto recuperado
 (`Retriever` configurado) — sin RAG no hay nada contra qué comparar, así
@@ -719,7 +743,7 @@ hasta v0.3).
 |------------------------------------|-----------------------------------------------------------------|
 | `aegis4j-api`                    | Contratos: `Provider`, `Guard`, `Skill`, `Persona`                  |
 | `aegis4j-core`                   | `Aegis4jEngine`, `GuardChain`, `SkillRegistry`, `ProviderRegistry`   |
-| `aegis4j-guardrails-builtin`     | `MaxLengthGuard`, `RegexPiiGuard`, `PromptInjectionGuard`, `JsonSchemaOutputGuard`, `HallucinationGuard` |
+| `aegis4j-guardrails-builtin`     | `MaxLengthGuard`, `RegexPiiGuard`, `PromptInjectionGuard`, `EncodedInjectionGuard`, `JsonSchemaOutputGuard`, `HallucinationGuard` |
 | `aegis4j-skills`                 | `MarkdownSkillLoader`                                                |
 | `aegis4j-provider-http-support`  | Plumbing HTTP compartido entre providers                            |
 | `aegis4j-provider-ollama`        | `Provider` para Ollama                                               |
