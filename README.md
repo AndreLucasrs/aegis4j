@@ -1,5 +1,7 @@
 # Aegis4J
 
+[![CI](https://github.com/AndreLucasrs/aegis4j/actions/workflows/ci.yml/badge.svg)](https://github.com/AndreLucasrs/aegis4j/actions/workflows/ci.yml)
+
 🇧🇷 Português | [🇬🇧 English](README.en.md) | [🇪🇸 Español](README.es.md)
 
 Uma lib para o ecossistema JVM (Java, Kotlin, Clojure, Scala) que fica na frente
