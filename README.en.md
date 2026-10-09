@@ -588,6 +588,7 @@ sensitive detail) and lets the model decide what to do.
 | `EncodedInjectionGuard` | Catches injection hidden behind an encoding: Base64, hex, binary, Morse, percent/`\u`/HTML entities, ROT13, reversed text, invisible Unicode tag characters ("ASCII smuggling"), full-width/homoglyphs, leetspeak and layered combinations (Base64 of Morse…). Decodes up to 3 layers and re-applies `PromptInjectionGuard`'s heuristics to every view; if the decoding budget is exhausted it **blocks** (fail-closed). `EncodedInjectionGuard.strict()` blocks any decodable text payload. Same limits: it cannot decode an unknown cipher. |
 | `JsonSchemaOutputGuard` | Validates that the output is valid JSON matching a supplied JSON Schema. |
 | `HallucinationGuard` | LLM-as-judge: uses a second `Provider` to assess whether the response is grounded in the retrieved (RAG) context. `WARN` mode (default, annotates a warning) or `STRICT` (blocks); fails open on any judge failure/unparseable response. |
+| `GuardrailsAiGuard` | Delegates validation to a [Guardrails AI Server](https://github.com/guardrails-ai/guardrails-api) you host (validators from the [Hub](https://guardrailsai.com/hub) or your own). **Fail-closed** by default. Module `aegis4j-guardrails-guardrailsai`. |
 
 ```java
 GuardChain chain = GuardChain.of(
@@ -622,6 +623,32 @@ withheld too (fail-closed). None of the blocked content reaches the model.
 `HallucinationGuard` only calls the judge when there's retrieved context
 (`Retriever` configured) — with no RAG, there's nothing to compare against,
 so it passes through at no extra cost.
+
+### Guardrails AI Hub (optional)
+
+`GuardrailsAiGuard` sends the text to your own Guardrails Server (`POST /guards/{guard}/validate`):
+rejected → blocks; `fix` action → uses the corrected text; server down, timeout or 401 → blocks
+(`FailMode.FAIL_OPEN` flips that).
+
+```bash
+pip install guardrails-ai guardrails-api
+guardrails start --config config.py --port 8000
+```
+
+```java
+GuardChain.of(
+        EncodedInjectionGuard.defaultPatterns(),  // local and cheap: runs before the network call
+        GuardrailsAiGuard.builder("http://localhost:8000", "my-guard")
+                .apiKey(token).timeout(Duration.ofSeconds(3)).build());
+// in untrustedContentGuards (input only): GuardrailsAiGuard.inputOnly(url, "my-guard")
+```
+
+- **Privacy:** the text leaves the JVM for your Guardrails Server. Review its telemetry: in our
+  tests it tried to export OpenTelemetry traces to an external host.
+- **Latency:** ~22 ms (p50) per call with a trivial local validator; ML-backed validators cost
+  more (not measured).
+- **Tested:** guardrails-ai 0.6.8 / guardrails-api 0.1.0 with a custom validator (`fix`,
+  `exception`, `noop`) and Bearer via a proxy. **Not tested:** Hub validators, guardrails-api 0.2.x.
 
 ## Observability
 
@@ -740,6 +767,7 @@ yet (`listPrompts()` throws `UnsupportedOperationException` until v0.3).
 | `aegis4j-api`                    | Contracts: `Provider`, `Guard`, `Skill`, `Persona`                 |
 | `aegis4j-core`                   | `Aegis4jEngine`, `GuardChain`, `SkillRegistry`, `ProviderRegistry`  |
 | `aegis4j-guardrails-builtin`     | `MaxLengthGuard`, `RegexPiiGuard`, `PromptInjectionGuard`, `EncodedInjectionGuard`, `JsonSchemaOutputGuard`, `HallucinationGuard` |
+| `aegis4j-guardrails-guardrailsai` | `GuardrailsAiGuard` (HTTP adapter for the Guardrails AI Server) |
 | `aegis4j-skills`                 | `MarkdownSkillLoader`                                               |
 | `aegis4j-provider-http-support`  | HTTP plumbing shared across providers                              |
 | `aegis4j-provider-ollama`        | `Provider` for Ollama                                               |
