@@ -584,7 +584,7 @@ decidir o que fazer.
 | `EncodedInjectionGuard` | Pega injeção escondida em codificação: Base64, hex, binário, Morse, percent/`\u`/entidades HTML, ROT13, texto invertido, caracteres Unicode invisíveis ("ASCII smuggling"), full-width/homóglifos, leetspeak e camadas combinadas (Base64 de Morse…). Decodifica até 3 camadas e reaplica as heurísticas do `PromptInjectionGuard` em cada versão; estourou o orçamento de decodificação, **bloqueia** (fail-closed). `EncodedInjectionGuard.strict()` bloqueia qualquer payload de texto decodificável. Mesmas limitações: não decodifica cifra desconhecida. |
 | `JsonSchemaOutputGuard` | Valida que o output é JSON válido batendo um JSON Schema fornecido. |
 | `HallucinationGuard` | LLM-as-judge: usa um segundo `Provider` pra avaliar se a resposta está fundamentada no contexto recuperado (RAG). Modo `WARN` (default, anota aviso) ou `STRICT` (bloqueia); fail-open em qualquer falha/resposta não-parseável do juiz. |
-| `GuardrailsAiGuard` | Delega a validação a um [Guardrails AI Server](https://github.com/guardrails-ai/guardrails-api) que você hospeda — dá acesso aos validators do [Guardrails Hub](https://guardrailsai.com/hub) (jailbreak por ML, PII via Presidio, toxicidade…) sem Python na JVM. **Fail-closed** por padrão. Módulo `aegis4j-guardrails-guardrailsai`. |
+| `GuardrailsAiGuard` | Delega a validação a um [Guardrails AI Server](https://github.com/guardrails-ai/guardrails-api) seu (validators do [Hub](https://guardrailsai.com/hub) ou próprios). **Fail-closed** por padrão. Módulo `aegis4j-guardrails-guardrailsai`. |
 
 ```java
 GuardChain chain = GuardChain.of(
@@ -623,37 +623,29 @@ passa direto sem custo extra.
 
 ### Guardrails AI Hub (opcional)
 
-`GuardrailsAiGuard` chama `POST {baseUrl}/guards/{guard}/validate` num Guardrails
-Server seu e converte o veredito: reprovou → bloqueia; validator com ação `fix`
-→ o texto corrigido substitui o original; servidor fora do ar/timeout →
-**bloqueia** (`FailMode.FAIL_OPEN` inverte isso).
+`GuardrailsAiGuard` envia o texto a um Guardrails Server seu (`POST /guards/{guard}/validate`):
+reprovou → bloqueia; ação `fix` → usa o texto corrigido; servidor fora do ar, timeout ou 401 →
+bloqueia (`FailMode.FAIL_OPEN` inverte isso).
 
 ```bash
 pip install guardrails-ai guardrails-api
-guardrails start --config config.py --port 8000   # seus guards (Hub ou validators próprios)
+guardrails start --config config.py --port 8000
 ```
 
 ```java
-GuardChain chain = GuardChain.of(
-        EncodedInjectionGuard.defaultPatterns(),   // antes: decodifica Base64/Morse…
+GuardChain.of(
+        EncodedInjectionGuard.defaultPatterns(),  // local e barato: roda antes da chamada de rede
         GuardrailsAiGuard.builder("http://localhost:8000", "meu-guard")
-                .apiKey(System.getenv("GUARDRAILS_TOKEN")) // opcional
-                .timeout(Duration.ofSeconds(3))
-                .build());
-// em untrustedContentGuards, só input: GuardrailsAiGuard.inputOnly(url, "meu-guard")
+                .apiKey(token).timeout(Duration.ofSeconds(3)).build());
+// em untrustedContentGuards (só input): GuardrailsAiGuard.inputOnly(url, "meu-guard")
 ```
 
-- **Privacidade:** o texto vai para o Guardrails Server — use um que você controle.
-  Durante o teste vimos o servidor tentando exportar traces OpenTelemetry para um
-  host externo; revise a telemetria do seu deploy.
-- **Latência:** validators com modelos de ML somam tempo a cada request; mantenha o
-  timeout curto e prefira `inputOnly` quando só a entrada importa.
-- **Ordem:** os validators veem o texto como chega; o `EncodedInjectionGuard` não
-  repassa a versão decodificada, então os dois se complementam, não se substituem.
-- **O que foi verificado:** o contrato foi conferido à mão contra um servidor real
-  (guardrails-ai 0.6.8 / guardrails-api 0.1.0) com um validator customizado nas ações
-  `fix`, `exception` e `noop`. **Não** foi testado com validators do Hub, outras
-  versões do servidor nem deploys autenticados.
+- **Privacidade:** o texto sai da JVM para o seu Guardrails Server. Revise a telemetria dele: nos
+  testes ele tentou exportar traces OpenTelemetry para um host externo.
+- **Latência:** ~22 ms (p50) por chamada com um validator trivial local; validators com ML custam
+  mais (não medido).
+- **Testado:** guardrails-ai 0.6.8 / guardrails-api 0.1.0 com validator próprio (`fix`, `exception`,
+  `noop`) e Bearer via proxy. **Não testado:** validators do Hub, guardrails-api 0.2.x.
 
 ## Observabilidade
 
