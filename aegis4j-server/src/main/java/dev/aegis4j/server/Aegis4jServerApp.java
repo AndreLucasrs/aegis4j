@@ -2,6 +2,7 @@ package dev.aegis4j.server;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import dev.aegis4j.api.guard.Guard;
 import dev.aegis4j.api.rag.Retriever;
 import dev.aegis4j.core.engine.Aegis4jEngine;
 import dev.aegis4j.core.guard.GuardChain;
@@ -46,6 +47,8 @@ public final class Aegis4jServerApp {
         int maxInputChars = Integer.parseInt(System.getenv().getOrDefault("AEGIS4J_MAX_INPUT_CHARS", "4000"));
         String skillsDir = System.getenv("AEGIS4J_SKILLS_DIR");
         String serverApiKey = System.getenv("AEGIS4J_SERVER_API_KEY");
+        // Parsed first so a typo fails fast, before any provider/MCP connection is opened.
+        InjectionGuardMode injectionMode = InjectionGuardMode.parse(System.getenv(InjectionGuardMode.ENV_VAR));
 
         ProviderRegistry providerRegistry = new ProviderRegistry();
         providerRegistry.discover(Thread.currentThread().getContextClassLoader());
@@ -58,13 +61,23 @@ public final class Aegis4jServerApp {
 
         Aegis4jEngine engine = Aegis4jEngine.builder()
                 .providerRegistry(providerRegistry)
-                .guardChain(GuardChain.of(MaxLengthGuard.forInput(maxInputChars), RegexPiiGuard.allPatterns()))
+                .guardChain(inputGuardChain(maxInputChars, injectionMode))
+                .untrustedContentGuards(new GuardChain(injectionMode.guards()))
                 .skillRegistry(skillRegistry)
                 .retriever(buildRetriever())
                 .modelRouter(buildModelRouter())
                 .build();
 
         createApp(engine, providerId, serverApiKey).start(port);
+    }
+
+    /** MaxLength, PII, then (unless opted out) the prompt-injection guards — cheapest checks first. */
+    static GuardChain inputGuardChain(int maxInputChars, InjectionGuardMode mode) {
+        List<Guard> guards = new ArrayList<>();
+        guards.add(MaxLengthGuard.forInput(maxInputChars));
+        guards.add(RegexPiiGuard.allPatterns());
+        guards.addAll(mode.guards());
+        return new GuardChain(guards);
     }
 
     /**

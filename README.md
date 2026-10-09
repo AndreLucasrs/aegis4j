@@ -131,6 +131,7 @@ Variáveis de ambiente (todas opcionais):
 | `AEGIS4J_PROVIDER_ID`         | `ollama`                  | Provider ativo                                           |
 | `AEGIS4J_OLLAMA_BASE_URL`     | `http://localhost:11434`  | Base URL do Ollama                                       |
 | `AEGIS4J_MAX_INPUT_CHARS`     | `4000`                    | Teto de caracteres de input (guard `MaxLengthGuard`)      |
+| `AEGIS4J_INJECTION_GUARDS`    | `on`                      | Guards de prompt injection (`PromptInjectionGuard` + `EncodedInjectionGuard`) no input e nos chunks de RAG: `on`, `strict` (bloqueia qualquer payload de texto codificado) ou `off`. Valor inválido impede o servidor de subir |
 | `AEGIS4J_SERVER_API_KEY`      | *(nenhum)*                | Protege o próprio servidor: se setada, todo request para endpoints não-`/health` precisa do header `Authorization: Bearer <chave>`, senão retorna `401`. Se não setada, o servidor fica aberto (comportamento padrão, compatível com versões anteriores) |
 | `AEGIS4J_SKILLS_DIR`          | *(nenhum)*                | Diretório com skills declarativas (`.md` + frontmatter)   |
 | `AEGIS4J_RETRIEVER`           | *(nenhum)*                | `mcp` — ativa retrieval via MCP (`pgvector` lança erro explícito em v0.2, ver [limitações](#escopo-e-limitações-v03)) |
@@ -143,6 +144,8 @@ Variáveis de ambiente (todas opcionais):
 | `AEGIS4J_OPENAI_COMPATIBLE_ID`      | *(nenhum)*          | Ativa um `OpenAiCompatibleProvider` genérico (ex: `openai`, `deepseek`, `kimi`) — precisa de `_BASE_URL` também |
 | `AEGIS4J_OPENAI_COMPATIBLE_BASE_URL`| *(nenhum)*          | Base URL do backend compatível com OpenAI                  |
 | `AEGIS4J_OPENAI_COMPATIBLE_API_KEY` | *(nenhum)*          | Chave de API do backend, se precisar                        |
+
+> **Mudança de comportamento padrão:** a partir desta versão o servidor bloqueia (HTTP 400) input com padrões de prompt injection, inclusive codificados em Base64, Morse etc. Para manter o comportamento anterior, defina `AEGIS4J_INJECTION_GUARDS=off`.
 
 Exemplo com a skill de exemplo (`aegis4j-server/src/main/resources/skills`)
 carregada:
