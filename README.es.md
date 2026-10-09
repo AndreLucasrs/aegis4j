@@ -1,5 +1,7 @@
 # Aegis4J
 
+[![CI](https://github.com/AndreLucasrs/aegis4j/actions/workflows/ci.yml/badge.svg)](https://github.com/AndreLucasrs/aegis4j/actions/workflows/ci.yml)
+
 [🇧🇷 Português](README.md) | [🇬🇧 English](README.en.md) | 🇪🇸 Español
 
 Una librería para el ecosistema JVM (Java, Kotlin, Clojure, Scala) que se
