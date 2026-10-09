@@ -132,6 +132,7 @@ Environment variables (all optional):
 | `AEGIS4J_PROVIDER_ID`         | `ollama`                  | Active provider                                            |
 | `AEGIS4J_OLLAMA_BASE_URL`     | `http://localhost:11434`  | Ollama base URL                                            |
 | `AEGIS4J_MAX_INPUT_CHARS`     | `4000`                    | Input character ceiling (`MaxLengthGuard`)                 |
+| `AEGIS4J_INJECTION_GUARDS`    | `on`                      | Prompt-injection guards (`PromptInjectionGuard` + `EncodedInjectionGuard`) on input and RAG chunks: `on`, `strict` (blocks any encoded text payload) or `off`. An invalid value stops the server from starting |
 | `AEGIS4J_SERVER_API_KEY`      | *(none)*                  | Protects the server itself: when set, every request to non-`/health` endpoints needs an `Authorization: Bearer <key>` header, otherwise it gets `401`. When unset, the server stays open (default, backward-compatible behavior) |
 | `AEGIS4J_SKILLS_DIR`          | *(none)*                  | Directory with declarative skills (`.md` + frontmatter)    |
 | `AEGIS4J_RETRIEVER`           | *(none)*                  | `mcp` — enables retrieval via MCP (`pgvector` throws an explicit error in v0.2, see [limitations](#scope-and-limitations-v03)) |
@@ -144,6 +145,8 @@ Environment variables (all optional):
 | `AEGIS4J_OPENAI_COMPATIBLE_ID`      | *(none)*            | Enables a generic `OpenAiCompatibleProvider` (e.g. `openai`, `deepseek`, `kimi`) — needs `_BASE_URL` too |
 | `AEGIS4J_OPENAI_COMPATIBLE_BASE_URL`| *(none)*            | Base URL of the OpenAI-compatible backend                  |
 | `AEGIS4J_OPENAI_COMPATIBLE_API_KEY` | *(none)*            | API key for that backend, if needed                          |
+
+> **Default behavior change:** the server now blocks (HTTP 400) input matching prompt-injection patterns, including ones hidden in Base64, Morse, etc. To keep the previous behavior, set `AEGIS4J_INJECTION_GUARDS=off`.
 
 Example with the sample skill (`aegis4j-server/src/main/resources/skills`)
 loaded:
