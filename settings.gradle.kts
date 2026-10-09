@@ -14,6 +14,7 @@ include(
     "aegis4j-api",
     "aegis4j-core",
     "aegis4j-guardrails-builtin",
+    "aegis4j-guardrails-guardrailsai",
     "aegis4j-skills",
     "aegis4j-provider-http-support",
     "aegis4j-provider-ollama",

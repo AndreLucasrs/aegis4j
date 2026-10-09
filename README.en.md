@@ -583,6 +583,7 @@ sensitive detail) and lets the model decide what to do.
 | `EncodedInjectionGuard` | Catches injection hidden behind an encoding: Base64, hex, binary, Morse, percent/`\u`/HTML entities, ROT13, reversed text, invisible Unicode tag characters ("ASCII smuggling"), full-width/homoglyphs, leetspeak and layered combinations (Base64 of Morse…). Decodes up to 3 layers and re-applies `PromptInjectionGuard`'s heuristics to every view; if the decoding budget is exhausted it **blocks** (fail-closed). `EncodedInjectionGuard.strict()` blocks any decodable text payload. Same limits: it cannot decode an unknown cipher. |
 | `JsonSchemaOutputGuard` | Validates that the output is valid JSON matching a supplied JSON Schema. |
 | `HallucinationGuard` | LLM-as-judge: uses a second `Provider` to assess whether the response is grounded in the retrieved (RAG) context. `WARN` mode (default, annotates a warning) or `STRICT` (blocks); fails open on any judge failure/unparseable response. |
+| `GuardrailsAiGuard` | Delegates validation to a [Guardrails AI Server](https://github.com/guardrails-ai/guardrails-api) you host — gives access to [Guardrails Hub](https://guardrailsai.com/hub) validators (ML jailbreak detection, Presidio PII, toxicity…) without Python in the JVM. **Fail-closed** by default. Module `aegis4j-guardrails-guardrailsai`. |
 
 ```java
 GuardChain chain = GuardChain.of(
@@ -617,6 +618,40 @@ withheld too (fail-closed). None of the blocked content reaches the model.
 `HallucinationGuard` only calls the judge when there's retrieved context
 (`Retriever` configured) — with no RAG, there's nothing to compare against,
 so it passes through at no extra cost.
+
+### Guardrails AI Hub (optional)
+
+`GuardrailsAiGuard` calls `POST {baseUrl}/guards/{guard}/validate` on a Guardrails
+Server of your own and maps the verdict: failed → block; a validator with a `fix`
+action → the fixed text replaces the original; server down/timeout → **block**
+(`FailMode.FAIL_OPEN` flips that).
+
+```bash
+pip install guardrails-ai guardrails-api
+guardrails start --config config.py --port 8000   # your guards (Hub or custom validators)
+```
+
+```java
+GuardChain chain = GuardChain.of(
+        EncodedInjectionGuard.defaultPatterns(),   // first: decodes Base64/Morse…
+        GuardrailsAiGuard.builder("http://localhost:8000", "my-guard")
+                .apiKey(System.getenv("GUARDRAILS_TOKEN")) // optional
+                .timeout(Duration.ofSeconds(3))
+                .build());
+// inside untrustedContentGuards, input only: GuardrailsAiGuard.inputOnly(url, "my-guard")
+```
+
+- **Privacy:** the text is sent to the Guardrails Server — use one you control.
+  During testing we saw the server trying to export OpenTelemetry traces to an
+  external host; review the telemetry settings of your deployment.
+- **Latency:** validators backed by ML models add time to every request; keep the
+  timeout short and prefer `inputOnly` when only the input matters.
+- **Order:** validators see the text as it arrives; `EncodedInjectionGuard` does not
+  hand its decoded view on, so the two complement each other rather than overlap.
+- **What was verified:** the contract was checked by hand against a real server
+  (guardrails-ai 0.6.8 / guardrails-api 0.1.0) with a custom validator under the
+  `fix`, `exception` and `noop` actions. It was **not** tested with Hub validators,
+  other server versions, or authenticated deployments.
 
 ## Observability
 
@@ -735,6 +770,7 @@ yet (`listPrompts()` throws `UnsupportedOperationException` until v0.3).
 | `aegis4j-api`                    | Contracts: `Provider`, `Guard`, `Skill`, `Persona`                 |
 | `aegis4j-core`                   | `Aegis4jEngine`, `GuardChain`, `SkillRegistry`, `ProviderRegistry`  |
 | `aegis4j-guardrails-builtin`     | `MaxLengthGuard`, `RegexPiiGuard`, `PromptInjectionGuard`, `EncodedInjectionGuard`, `JsonSchemaOutputGuard`, `HallucinationGuard` |
+| `aegis4j-guardrails-guardrailsai` | `GuardrailsAiGuard` (HTTP adapter for the Guardrails AI Server) |
 | `aegis4j-skills`                 | `MarkdownSkillLoader`                                               |
 | `aegis4j-provider-http-support`  | HTTP plumbing shared across providers                              |
 | `aegis4j-provider-ollama`        | `Provider` for Ollama                                               |
